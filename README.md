@@ -6,6 +6,131 @@ Esta solución despliega una VNet Hub con Azure VPN Gateway, una o más conexion
 
 El despliegue es Bicep a nivel de Resource Group y usa modo incremental. El Resource Group debe existir; los scripts no lo crean ni lo eliminan. Los recursos de la solución llevan el tag `Solution=hybrid-vpn-bicep`. El script detiene la operación si detecta una colisión de nombres sin ese tag.
 
+> **Estado:** plantilla de referencia. Los CIDR, región, nombres y endpoints del archivo de ejemplo son ilustrativos; deben reemplazarse y validarse antes de cualquier despliegue.
+
+## Índice
+
+- [Arquitectura y diagramas](#arquitectura-y-diagramas)
+- [Supuestos y requisitos](#2-supuestos)
+- [Decisiones de arquitectura](#3-decisiones-de-arquitectura)
+- [Estructura del repositorio](#4-estructura-del-repositorio)
+- [Preparación de parámetros](#5-archivos-de-implementación)
+- [Validación local y contra Azure](#6-validación)
+- [What-if y despliegue](#7-what-if)
+- [DDNS, NAT y cambios de IP](#9-configuración-de-ddns)
+- [Configuración IPsec](#10-configuración-ipsec)
+- [Pruebas y operación](#11-pruebas)
+- [Troubleshooting](#13-troubleshooting)
+- [Datos pendientes](#14-datos-pendientes)
+
+## Arquitectura y diagramas
+
+### Vista de infraestructura
+
+El Hub concentra el VPN Gateway y sus conexiones. Cada oficina tiene su propio Local Network Gateway (LNG), conexión IPsec y secreto PSK en Key Vault. Los peerings conectan el Hub con cada Spoke; Firewall, Bastion y Private DNS solo se despliegan según los parámetros opcionales.
+
+```mermaid
+flowchart LR
+    subgraph OnPrem["Oficinas / sitios"]
+        O1["OPNsense oficina 01<br/>WAN dinámica · DDNS FQDN<br/>LAN: prefijos on-premises"]
+        O2["OPNsense oficina N<br/>WAN dinámica · DDNS FQDN<br/>LAN: prefijos on-premises"]
+    end
+
+    DNS["Proveedor DDNS<br/>FQDN → IP WAN actual"]
+    Internet(("Internet"))
+
+    subgraph Azure["Azure · Resource Group existente"]
+        subgraph Hub["VNet Hub"]
+            GW["VPN Gateway<br/>Route-based · IKEv2"]
+            LNG1["Local Network Gateway 01<br/>FQDN + prefijos LAN"]
+            LNG2["Local Network Gateway N<br/>FQDN + prefijos LAN"]
+            C1["S2S Connection 01<br/>IPsec / IKEv2"]
+            CN["S2S Connection N<br/>IPsec / IKEv2"]
+            SHARED["SharedServicesSubnet"]
+            MGMT["NetworkManagementSubnet"]
+            OPT["Opcionales, por defecto OFF<br/>Azure Firewall · Azure Bastion"]
+        end
+        subgraph Spokes["VNets Spoke"]
+            S1["Spoke 01<br/>Subnets + NSG"]
+            SN["Spoke N<br/>Subnets + NSG"]
+        end
+        KV["Key Vault existente<br/>PSK independiente por oficina"]
+    end
+
+    O1 -. "actualiza registro" .-> DNS
+    O2 -. "actualiza registro" .-> DNS
+    O1 ==>|"IPsec / IKEv2"| Internet
+    O2 ==>|"IPsec / IKEv2"| Internet
+    Internet ==>|"túnel hacia IP pública Azure"| GW
+    DNS -. "Azure resuelve el FQDN configurado en LNG" .-> LNG1
+    DNS -. "Azure resuelve el FQDN configurado en LNG" .-> LNG2
+    GW --- C1
+    LNG1 --- C1
+    GW --- CN
+    LNG2 --- CN
+    GW <--> S1
+    GW <--> SN
+    KV -. "referencia segura durante deployment" .-> C1
+    KV -. "referencia segura durante deployment" .-> CN
+```
+
+### Vista lógica de conectividad y red
+
+Ejemplo con los CIDR ficticios del archivo de parámetros. Sustituirlos por rangos reales sin solapamiento antes de desplegar. La ruta entre oficinas y Spokes atraviesa el VPN Gateway y el peering; el NSG de cada subnet Spoke es el control de entrada declarado por la plantilla.
+
+```mermaid
+flowchart LR
+    subgraph Office["Oficina (ejemplo)"]
+        LAN["LAN on-premises<br/>192.168.10.0/24"]
+        FW["OPNsense<br/>WAN pública dinámica"]
+        LAN --> FW
+    end
+
+    FQDN["FQDN DDNS<br/>resuelve la IP WAN actual"]
+    WAN(("Internet"))
+
+    subgraph Hub["Hub VNet · 10.100.0.0/24"]
+        GWNET["GatewaySubnet<br/>10.100.0.0/27<br/>sin NSG ni route table"]
+        GW["Azure VPN Gateway"]
+        SHARED["SharedServicesSubnet<br/>10.100.0.192/27"]
+        MGMT["NetworkManagementSubnet<br/>10.100.0.224/27"]
+        GWNET --- GW
+    end
+
+    subgraph Spoke1["Spoke apps-01 · 10.101.0.0/24"]
+        NSG1["NSG del Spoke<br/>allow TCP autorizado desde oficinas"]
+        SUB1["Subnets de aplicación<br/>10.101.0.0/25"]
+        SUB1 --- NSG1
+    end
+    subgraph Spoke2["Spoke apps-02 · 10.102.0.0/24"]
+        NSG2["NSG del Spoke<br/>allow TCP autorizado desde oficinas"]
+        SUB2["Subnets de aplicación<br/>10.102.0.0/25"]
+        SUB2 --- NSG2
+    end
+
+    FW -. "DDNS: solo nombre, no IP fija" .-> FQDN
+    FW ==>|"IKEv2 / IPsec · UDP 500/4500"| WAN
+    WAN ==>|túnel| GW
+    GW -->|"Peering Hub→Spoke: allowGatewayTransit"| NSG1
+    NSG1 -->|"Peering Spoke→Hub: useRemoteGateways"| GW
+    GW -->|"Peering Hub→Spoke: allowGatewayTransit"| NSG2
+    NSG2 -->|"Peering Spoke→Hub: useRemoteGateways"| GW
+```
+
+#### Reglas para interpretar el diagrama
+
+- `GatewaySubnet` hospeda el VPN Gateway y no lleva NSG ni route table.
+- `allowGatewayTransit` se activa en el extremo Hub; `useRemoteGateways` se activa en el extremo Spoke.
+- Las flechas de peering representan conectividad de red, no una promesa de que cualquier flujo esté permitido por NSG, firewall del host o políticas IPsec.
+- El ejemplo no crea conectividad Spoke-to-Spoke ni inserta Azure Firewall en el camino del tráfico.
+- El estado de Firewall/Bastion es **apagado** hasta que se habiliten explícitamente; su presencia en la vista de infraestructura es solo una opción.
+- Los CIDR del gráfico coinciden con el ejemplo actual y no son una asignación recomendada para todos los entornos.
+
+#### Fuentes editables
+
+- [Diagrama de infraestructura (Excalidraw)](docs/infraestructura.excalidraw)
+- [Diagrama de conectividad y red (Excalidraw)](docs/conectividad-red.excalidraw)
+
 ## 2. Supuestos
 
 - El Resource Group objetivo y el Key Vault ya existen.
@@ -14,7 +139,7 @@ El despliegue es Bicep a nivel de Resource Group y usa modo incremental. El Reso
 - Los datos de `main.parameters.example.json` son ejemplos no desplegables. No contienen PSK ni token DDNS.
 - La configuración de ejemplo usa `mexicocentral`; confirmar la disponibilidad regional del SKU elegido antes de desplegar.
 - BGP, Azure Firewall y Azure Bastion están deshabilitados por defecto. No se agregan rutas forzadas ni se habilita tránsito Spoke-to-Spoke.
-- Las reglas de NSG de ejemplo están vacías: no se permite tráfico de entrada adicional a Spokes hasta declarar los puertos autorizados.
+- Las reglas personalizadas de NSG están vacías en el ejemplo: no se añade una autorización TCP explícita desde las oficinas. Se mantienen las reglas predeterminadas de NSG de Azure; revisar el comportamiento efectivo antes de producción.
 
 ## 3. Decisiones de arquitectura
 
@@ -47,6 +172,9 @@ El despliegue es Bicep a nivel de Resource Group y usa modo incremental. El Reso
 
 ```text
 .
+├── docs/
+│   ├── conectividad-red.excalidraw
+│   └── infraestructura.excalidraw
 ├── main.bicep
 ├── main.parameters.example.json
 ├── modules/
@@ -63,13 +191,30 @@ El despliegue es Bicep a nivel de Resource Group y usa modo incremental. El Reso
 - `modules/vpn-connection.bicep`: recurso de conexión IPsec con parámetro seguro para el PSK recuperado desde Key Vault.
 - `main.parameters.example.json`: plantilla de configuración con valores ficticios y placeholders.
 - `scripts/vpn.ps1`: validación, what-if, despliegue, comprobación DDNS, estado de conexiones y pruebas TCP.
+- `docs/*.excalidraw`: fuentes editables de los diagramas de infraestructura y red. Los diagramas Mermaid anteriores son las vistas rápidas para GitHub.
 - `.gitignore`: excluye los parámetros locales y los artefactos de compilación.
 
 Copiar el ejemplo a `main.parameters.json` y reemplazar los datos pendientes. El archivo local está ignorado por Git. No añadir PSK, API token ni contraseñas a ese archivo.
 
+### Parámetros de red de ejemplo
+
+| Segmento | CIDR de ejemplo | Uso |
+|---|---:|---|
+| Hub | `10.100.0.0/24` | Red central |
+| `GatewaySubnet` | `10.100.0.0/27` | VPN Gateway |
+| `AzureBastionSubnet` | `10.100.0.64/26` | Reservada si Bastion se habilita |
+| `AzureFirewallSubnet` | `10.100.0.128/26` | Reservada si Firewall se habilita |
+| Shared Services | `10.100.0.192/27` | Servicios compartidos |
+| Network Management | `10.100.0.224/27` | Administración de red |
+| Spoke `apps-01` | `10.101.0.0/24` | Aplicaciones |
+| Spoke `apps-02` | `10.102.0.0/24` | Aplicaciones |
+| Oficina `office-01` | `192.168.10.0/24` | Prefijo on-premises de muestra |
+
+Los rangos de Bastion y Firewall solo se incorporan a la VNet Hub cuando se habilita el servicio correspondiente. La asignación de ejemplo está dentro del Hub y evita solapamientos.
+
 ## 6. Validación
 
-Requisitos locales: Azure CLI, Bicep CLI disponible mediante Azure CLI, PowerShell 7 recomendado, sesión Azure activa, Resource Group existente y Key Vault existente.
+Requisitos locales: Azure CLI con Bicep disponible, PowerShell 7 recomendado, sesión Azure activa para validación remota, Resource Group existente y Key Vault existente.
 
 ```powershell
 Copy-Item .\main.parameters.example.json .\main.parameters.json
@@ -82,6 +227,8 @@ Completar los valores y validar:
 ```
 
 La validación compila Bicep, comprueba placeholders, CIDR IPv4, solapamientos Azure/on-premises, subredes dentro de VNets, FQDN, campos BGP cuando aplica, estado de Azure, existencia del RG/Key Vault y ownership de recursos con el prefijo elegido. No cambia recursos ni lee el valor del PSK.
+
+`-LocalOnly` valida estructura, CIDR, nombres, placeholders y compila Bicep, pero **no** comprueba login, suscripción, existencia del Resource Group ni permisos/secretos de Key Vault.
 
 Para validar localmente sin consultar Azure:
 
@@ -101,6 +248,8 @@ Al habilitar BGP, definir además `azureBgpAsn`. Azure asigna la dirección de p
 
 Revisar el resultado completo antes del despliegue. El script detiene la operación si el what-if incluye un borrado o un tipo de cambio no reconocido. El modo incremental no elimina recursos que se quiten posteriormente de los arrays; retirarlos requiere un procedimiento explícito y revisión manual. No aprobar cambios fuera del prefijo/tags de esta solución.
 
+El what-if es una estimación del plano de control: confirmar en el resultado nombres, regiones, CIDR, peerings, reglas y recursos opcionales. No sustituye la aprobación del cambio ni la prueba de compatibilidad IPsec/OPNsense.
+
 ## 8. Despliegue
 
 ```powershell
@@ -110,6 +259,16 @@ Revisar el resultado completo antes del despliegue. El script detiene la operaci
 El script vuelve a validar, muestra el what-if, exige escribir `DEPLOY` y ejecuta `az deployment group create --mode Incremental`. No hay operación de crear o borrar Resource Group ni un modo Complete.
 
 Usar el mínimo privilegio. La identidad que ejecute el despliegue necesita permisos de escritura para los recursos declarados y permiso de lectura/deployment de secretos de Key Vault. Los nombres de secretos deben existir antes de crear las conexiones.
+
+### Secuencia recomendada
+
+1. Completar los parámetros locales y confirmar que no contienen valores secretos.
+2. Ejecutar `Validate`; corregir todos los errores.
+3. Revisar permisos de despliegue, disponibilidad regional/SKU, cuotas y secretos existentes en Key Vault.
+4. Ejecutar `WhatIf` y revisar cada cambio.
+5. Acordar una ventana de cambio; crear/desplegar el Hub y el túnel puede causar interrupciones.
+6. Ejecutar `Deploy`, revisar el resultado y verificar gateway, peerings, conexiones y estado del túnel.
+7. Configurar OPNsense y confirmar tráfico con pruebas autorizadas.
 
 ## 9. Configuración de DDNS
 
@@ -136,6 +295,8 @@ Double NAT ocurre cuando el módem/router del ISP y OPNsense traducen tráfico. 
 ### TTL y cambio de IP
 
 Configurar un TTL bajo que el proveedor DDNS realmente soporte, por ejemplo 60–300 segundos, y considerar sus límites/cachés. El TTL no elimina cachés recursivas ni acelera la actualización del proveedor. Tras un cambio de IP pueden persistir la IP anterior en cachés DNS; durante la convergencia, IKE/IPsec puede desconectarse temporalmente. DPD y rekey ayudan a recuperar, pero la reconexión no es instantánea.
+
+El FQDN se configura en el Local Network Gateway; no usar la salida de `CheckDns` para reemplazarlo por una IP en Bicep o en el archivo de parámetros.
 
 ## 10. Configuración IPsec
 
@@ -176,6 +337,15 @@ Probar destinos TCP definidos por el operador:
 
 Hacer pruebas progresivas: resolución DDNS, estado de conexión/IKE, oficina→Hub, oficina→Spoke, Spoke→oficina y finalmente servicio/puerto autorizado. Confirmar rutas efectivas, NSG, reglas IPsec/LAN y Outbound NAT.
 
+Lista de comprobación posterior al despliegue:
+
+- Confirmar que el FQDN devuelve la IPv4 WAN vigente de la oficina.
+- Confirmar estado conectado de la conexión VPN y negociación IKE/CHILD SA en ambos extremos.
+- Confirmar prefijos LAN del LNG y selectores/remotos configurados en OPNsense.
+- Confirmar estado de ambos peerings por Spoke y las flags de tránsito en el lado correcto.
+- Probar por separado TCP a cada host/puerto aprobado; una conexión establecida no demuestra por sí sola que todas las rutas y aplicaciones funcionen.
+- Confirmar que no se ha asociado accidentalmente un NSG ni una route table a `GatewaySubnet`.
+
 ## 12. Operación
 
 - Mantener estables `resourcePrefix`, nombres de oficinas, nombres de Spokes y nombres de subred.
@@ -201,7 +371,7 @@ Hacer pruebas progresivas: resolución DDNS, estado de conexión/IKE, oficina→
 
 ## 14. Datos pendientes
 
-Antes de producción, completar y verificar:
+Antes de producción, completar y verificar esta lista por cada oficina y entorno:
 
 - FQDN DDNS real por oficina.
 - Prefijos reales por oficina.
