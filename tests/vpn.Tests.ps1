@@ -1,0 +1,240 @@
+$ErrorActionPreference = 'Stop'
+$repoRoot = Split-Path $PSScriptRoot -Parent
+$templateFile = Join-Path $repoRoot 'main.bicep'
+$source = Join-Path $repoRoot 'scripts\vpn.ps1'
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($source, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) { throw ($parseErrors | Out-String) }
+foreach ($definition in $ast.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+}, $false)) {
+    . ([scriptblock]::Create($definition.Extent.Text))
+}
+$realInvokeAz = (Get-Command Invoke-Az).ScriptBlock
+$SubscriptionId = '662141d0-0308-4187-b46b-db1e9466b5ac'
+$ResourceGroupName = 'test-rg'
+$baseId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Network"
+$parameterPath = Join-Path ([System.IO.Path]::GetTempPath()) ("vpn-tests-{0}.json" -f [guid]::NewGuid())
+$passed = 0
+
+function Assert-True {
+    param([bool]$Condition, [string]$Name)
+    if (-not $Condition) { throw "FAIL: $Name" }
+    $script:passed++
+    Write-Host "PASS: $Name"
+}
+
+function Assert-Throws {
+    param([scriptblock]$Action, [string]$Message, [string]$Name)
+    $caught = $null
+    try { & $Action | Out-Null } catch { $caught = $_.Exception.Message }
+    Assert-True ($null -ne $caught -and $caught -like "*$Message*") "$Name (received: $caught)"
+}
+
+function Reset-Fixture {
+    $script:configuration = (Get-Content (Join-Path $repoRoot 'main.parameters.example.json') -Raw).
+        Replace('CHANGE-ME', 'jaropro') | ConvertFrom-Json
+    $script:collections = @{
+        virtualNetworks = @()
+        localNetworkGateways = @()
+        virtualNetworkGateways = @()
+        virtualHubs = @()
+        vpnSites = @()
+    }
+    $script:responses = @{}
+    $script:failType = ''
+    $script:calls = [System.Collections.Generic.List[object]]::new()
+    $script:LocalOnly = $false
+    $script:Mode = 'Validate'
+}
+
+function New-Vnet {
+    param([string]$Id, [string[]]$Prefixes, [string]$Owner = '')
+    return [pscustomobject]@{
+        id = $Id
+        tags = @{ Solution = $Owner }
+        properties = @{
+            addressSpace = @{ addressPrefixes = $Prefixes }
+            subnets = @()
+            virtualNetworkPeerings = @()
+        }
+    }
+}
+
+function Invoke-Az {
+    param([string[]]$Arguments)
+    $script:calls.Add($Arguments)
+    switch ($Arguments[0]) {
+        'bicep' { return }
+        'account' { return $SubscriptionId }
+        'group' { return 'true' }
+        'resource' { return '[]' }
+        'keyvault' { return '/test/keyvault' }
+        'rest' {
+            $url = $Arguments[[array]::IndexOf($Arguments, '--url') + 1]
+            if ($responses.ContainsKey($url)) { return $responses[$url] }
+            if ($url -notmatch '/providers/Microsoft.Network/([^/?]+)\?') {
+                throw "Unexpected inventory URL: $url"
+            }
+            $type = $Matches[1]
+            if ($type -eq $failType) { throw 'Inventory permission denied' }
+            if (-not $collections.ContainsKey($type)) { throw "Unexpected collection: $type" }
+            return (@{ value = @($collections[$type]) } | ConvertTo-Json -Depth 30)
+        }
+        default { throw "Unexpected Azure command: $($Arguments -join ' ')" }
+    }
+}
+
+try {
+    Reset-Fixture
+    Assert-True (Test-RangeOverlap (ConvertTo-IPv4Range '10.100.0.0/24') (ConvertTo-IPv4Range '10.100.0.128/25')) 'contained CIDR overlaps'
+    Assert-True (Test-RangeOverlap (ConvertTo-IPv4Range '10.100.0.128/25') (ConvertTo-IPv4Range '10.100.0.0/24')) 'reverse containment overlaps'
+    Assert-True (-not (Test-RangeOverlap (ConvertTo-IPv4Range '10.100.0.0/25') (ConvertTo-IPv4Range '10.100.0.128/25'))) 'adjacent ranges do not overlap'
+    Assert-True (Test-RangeOverlap @{ Start = 10; End = 20 } @{ Start = 15; End = 25 }) 'partial interval overlap'
+    Assert-True (Test-RangeContains (ConvertTo-IPv4Range '10.100.0.0/24') (ConvertTo-IPv4Range '10.100.0.0/27')) 'gateway contained in hub'
+
+    $collections.virtualNetworks = @(
+        (New-Vnet "$baseId/virtualNetworks/vnet-superag-eastus" @('10.0.0.0/16')),
+        (New-Vnet "$baseId/virtualNetworks/vnet-finopsazure" @('10.30.0.0/16'))
+    )
+    Assert-AzureAddressAvailability $configuration $ResourceGroupName
+    Assert-True ($calls.Count -eq 5) 'nonconflicting inventory queried all five collections'
+    $collections.virtualNetworks += New-Vnet "$baseId/virtualNetworks/other" @('10.101.0.128/25') 'hybrid-vpn-bicep'
+    Assert-Throws { Assert-AzureAddressAvailability $configuration $ResourceGroupName } 'Address conflict' 'contained external prefix conflicts despite ownership tag'
+
+    Reset-Fixture
+    $own = New-Vnet "$baseId/virtualNetworks/jaropro-hub-vnet" @('10.100.0.0/24') 'hybrid-vpn-bicep'
+    $own.properties.subnets = @(@{
+        id = "$($own.id)/subnets/GatewaySubnet"
+        name = 'GatewaySubnet'
+        properties = @{ addressPrefix = '10.100.0.0/27' }
+    })
+    $collections.virtualNetworks = @($own)
+    $collections.localNetworkGateways = @(@{
+        id = "$baseId/localNetworkGateways/jaropro-office-01-lng"
+        tags = @{ Solution = 'hybrid-vpn-bicep' }
+        properties = @{ localNetworkAddressSpace = @{ addressPrefixes = @('192.168.50.0/24') } }
+    })
+    Assert-AzureAddressAvailability $configuration $ResourceGroupName
+    Assert-True $true 'unchanged exact owned VNet, subnet and LNG redeploy permitted'
+    $own.tags.Solution = ''
+    Assert-Throws { Assert-AzureAddressAvailability $configuration $ResourceGroupName } 'not solution-owned' 'exact ID without ownership rejected'
+    $own.tags.Solution = 'hybrid-vpn-bicep'
+    $own.properties.addressSpace.addressPrefixes = @('10.110.0.0/24')
+    Assert-Throws { Assert-AzureAddressAvailability $configuration $ResourceGroupName } 'Addressing change blocked' 'owned VNet renumbering rejected'
+    $own.properties.addressSpace.addressPrefixes = @('10.100.0.0/24')
+    $own.properties.subnets[0].properties.addressPrefix = '10.100.0.32/27'
+    Assert-Throws { Assert-AzureAddressAvailability $configuration $ResourceGroupName } 'Addressing change blocked' 'owned subnet renumbering rejected'
+    $own.properties.subnets[0].name = 'unknown-subnet'
+    Assert-Throws { Assert-AzureAddressAvailability $configuration $ResourceGroupName } 'Removal of existing subnet' 'owned subnet removal rejected'
+    $own.properties.subnets = @()
+    $collections.localNetworkGateways[0].properties.localNetworkAddressSpace.addressPrefixes = @('192.168.60.0/24')
+    Assert-Throws { Assert-AzureAddressAvailability $configuration $ResourceGroupName } 'Addressing change blocked' 'owned LNG renumbering rejected'
+
+    Reset-Fixture
+    $collections.localNetworkGateways = @(@{
+        id = "$baseId/localNetworkGateways/other"
+        properties = @{ localNetworkAddressSpace = @{ addressPrefixes = @('192.168.50.128/25') } }
+    })
+    Assert-Throws { Assert-AzureAddressAvailability $configuration $ResourceGroupName } 'Address conflict' 'external S2S LAN conflict'
+    $collections.localNetworkGateways = @()
+    $collections.virtualNetworkGateways = @(@{
+        id = "$baseId/virtualNetworkGateways/other"
+        properties = @{ vpnClientConfiguration = @{ vpnClientAddressPool = @{ addressPrefixes = @('10.102.0.0/25') } } }
+    })
+    Assert-Throws { Assert-AzureAddressAvailability $configuration $ResourceGroupName } 'Address conflict' 'P2S pool conflict'
+    $collections.virtualNetworkGateways[0].id = "$baseId/virtualNetworkGateways/jaropro-vpn-gateway"
+    Assert-Throws { Assert-AzureAddressAvailability $configuration $ResourceGroupName } 'preserve its addressing' 'existing own P2S configuration is never silently removed'
+    $collections.virtualNetworkGateways[0].id = "$baseId/virtualNetworkGateways/other"
+    $collections.virtualNetworkGateways[0].properties.vpnClientConfiguration = @{}
+    Assert-Throws { Assert-AzureAddressAvailability $configuration $ResourceGroupName } 'Missing P2S address pool' 'incomplete P2S inventory stops preflight'
+
+    Reset-Fixture
+    $remoteId = '/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/remote/providers/Microsoft.Network/virtualNetworks/remote'
+    $local = New-Vnet "$baseId/virtualNetworks/local" @('10.0.0.0/16')
+    $local.properties.virtualNetworkPeerings = @(@{ properties = @{ remoteVirtualNetwork = @{ id = $remoteId } } })
+    $collections.virtualNetworks = @($local)
+    $responses["https://management.azure.com${remoteId}?api-version=2024-05-01"] = (
+        New-Vnet $remoteId @('10.100.0.0/25') | ConvertTo-Json -Depth 20
+    )
+    Assert-Throws { Assert-AzureAddressAvailability $configuration $ResourceGroupName } 'Address conflict' 'remote peering live range conflict'
+    $responses.Clear()
+    Assert-Throws { Assert-AzureAddressAvailability $configuration $ResourceGroupName } 'Unexpected inventory URL' 'inaccessible remote VNet stops preflight'
+
+    Reset-Fixture
+    $failType = 'virtualNetworkGateways'
+    Assert-Throws { Assert-AzureAddressAvailability $configuration $ResourceGroupName } 'permission denied' 'inventory query error stops preflight'
+    Reset-Fixture
+    $firstUrl = "https://management.azure.com/subscriptions/$SubscriptionId/providers/Microsoft.Network/virtualNetworks?api-version=2024-05-01"
+    $responses[$firstUrl] = '{}'
+    Assert-Throws { Assert-AzureAddressAvailability $configuration $ResourceGroupName } 'Invalid network inventory' 'malformed inventory is not empty success'
+    $responses[$firstUrl] = (@{ value = @((New-Vnet "$baseId/virtualNetworks/empty" @(''))) } | ConvertTo-Json -Depth 20)
+    Assert-Throws { Assert-AzureAddressAvailability $configuration $ResourceGroupName } 'Missing VNet address space' 'empty inventory prefix is not silently skipped'
+    $responses[$firstUrl] = '{"value":[],"nextLink":"https://management.azure.com/test-next-page"}'
+    $responses['https://management.azure.com/test-next-page'] = (@{
+        value = @((New-Vnet "$baseId/virtualNetworks/page2" @('10.100.0.0/25')))
+    } | ConvertTo-Json -Depth 20)
+    Assert-Throws { Assert-AzureAddressAvailability $configuration $ResourceGroupName } 'Address conflict' 'pagination includes conflicting second page'
+
+    Reset-Fixture
+    $collections.virtualHubs = @(@{ id = "$baseId/virtualHubs/hub"; properties = @{} })
+    Assert-Throws { Assert-AzureAddressAvailability $configuration $ResourceGroupName } 'Virtual WAN' 'Virtual WAN requires separate review'
+
+    Reset-Fixture
+    $configuration | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $parameterPath
+    $LocalOnly = $true
+    $localOutput = @(Assert-Configuration 3>&1)
+    $result = $localOutput | Where-Object { $_ -isnot [System.Management.Automation.WarningRecord] }
+    $localWarnings = @($localOutput | Where-Object { $_ -is [System.Management.Automation.WarningRecord] })
+    Assert-True ($result.ActiveSubscription -eq 'not checked (LocalOnly)' -and $calls.Count -eq 1 -and $calls[0][0] -eq 'bicep') 'LocalOnly builds without Azure inventory'
+    Assert-True ("$localWarnings" -like '*availability*NOT checked*') 'LocalOnly explicitly warns about availability'
+    $Mode = 'WhatIf'
+    Assert-Throws { Assert-Configuration } 'LocalOnly is supported only with Validate' 'WhatIf cannot bypass inventory'
+    $Mode = 'Deploy'
+    Assert-Throws { Assert-Configuration } 'LocalOnly is supported only with Validate' 'Deploy preflight cannot bypass inventory (no deployment invoked)'
+    $Mode = 'Validate'
+    $LocalOnly = $false
+    $null = Assert-Configuration
+    Assert-True (@($calls | Where-Object { $_[0] -eq 'rest' }).Count -eq 5) 'remote Validate runs inventory'
+    $SubscriptionId = ''
+    Assert-Throws { Assert-Configuration } 'explicit SubscriptionId' 'subscription is mandatory'
+    $SubscriptionId = '662141d0-0308-4187-b46b-db1e9466b5ac'
+    $LocalOnly = $true
+    foreach ($excluded in @('192.168.4.0/24', '192.168.44.0/24', '192.168.5.0/29')) {
+        $configuration.parameters.offices.value[0].addressPrefixes = @($excluded)
+        $configuration | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $parameterPath
+        Assert-Throws { Assert-Configuration } 'excluded jaropro ISP/transit' "$excluded cannot be advertised"
+    }
+    $configuration.parameters.offices.value[0].addressPrefixes = @('192.168.0.0/16')
+    $configuration | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $parameterPath
+    Assert-Throws { Assert-Configuration } 'excluded jaropro ISP/transit' 'aggregate containing transit cannot be advertised'
+    $configuration.parameters.offices.value[0].addressPrefixes = @('192.168.50.0/24')
+    $configuration.parameters.vpnGatewayGeneration.value = 'Generation2'
+    $configuration | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $parameterPath
+    Assert-Throws { Assert-Configuration } 'requires Generation1' 'VpnGw1AZ Generation2 rejected'
+    $scriptText = Get-Content -LiteralPath $source -Raw
+    foreach ($modeName in @('Validate', 'WhatIf', 'Deploy')) {
+        $dispatchPattern = [regex]::Escape("'$modeName' {") + '\s+\$(?:validation|null) = Assert-Configuration'
+        Assert-True ($scriptText -match $dispatchPattern) "$modeName dispatch starts with shared preflight"
+    }
+
+    # Exercise the real command wrapper with a fake CLI; no process or Azure calls.
+    function az {
+        $script:cliArguments = @($args)
+        $global:LASTEXITCODE = 0
+        return 'ok'
+    }
+    $null = & $realInvokeAz -Arguments @('group', 'exists', '--name', 'test')
+    Assert-True ($cliArguments[-2] -eq '--subscription' -and $cliArguments[-1] -eq $SubscriptionId) 'CLI wrapper always passes explicit subscription'
+    $null = & $realInvokeAz -Arguments @('keyvault', 'show', '--subscription', 'other')
+    Assert-True (@($cliArguments | Where-Object { $_ -eq '--subscription' }).Count -eq 1) 'explicit Key Vault subscription preserved'
+    function az { $global:LASTEXITCODE = 1; return '' }
+    Assert-Throws { & $realInvokeAz -Arguments @('rest', '--method', 'get') } 'Azure CLI command failed' 'CLI failure is not empty success'
+
+    Write-Host "$passed assertions passed; no Azure resources or devices were contacted."
+}
+finally {
+    if (Test-Path -LiteralPath $parameterPath) { Remove-Item -LiteralPath $parameterPath }
+}

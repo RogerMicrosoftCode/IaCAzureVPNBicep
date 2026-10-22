@@ -31,7 +31,7 @@ param vpnGatewaySku string = 'VpnGw1AZ'
   'Generation1'
   'Generation2'
 ])
-param vpnGatewayGeneration string = 'Generation2'
+param vpnGatewayGeneration string = 'Generation1'
 
 @description('Enable BGP on the VPN Gateway and all office connections.')
 param enableBgp bool = false
@@ -208,6 +208,10 @@ resource hubToSpokePeerings 'Microsoft.Network/virtualNetworks/virtualNetworkPee
 resource spokeToHubPeerings 'Microsoft.Network/virtualNetworks/virtualNetworkPeerings@2024-05-01' = [for (spoke, spokeIndex) in spokes: {
   parent: spokeVnets[spokeIndex]
   name: '${resourcePrefix}-spoke-to-hub'
+  dependsOn: [
+    vpnGateway
+    hubToSpokePeerings[spokeIndex]
+  ]
   properties: {
     remoteVirtualNetwork: {
       id: hubVnet.id
