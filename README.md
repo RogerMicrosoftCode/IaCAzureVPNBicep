@@ -1,422 +1,879 @@
-1. Arquitectura recomendada
-Tu escenario quedaría así:
-Plain Text
-OFICINA
-192.168.x.x
-|
-OPNsense
-|
-WAN: IP pública dinámica
-|
-DDNS
-vpn-oficina.tudominio.com
-|
-| IKEv2 / IPsec
-|
-Internet
-|
+Landing Zone de conectividad híbrida Azure con OPNsense
+Descripción
+Este repositorio contiene la definición de Infrastructure as Code para desplegar una landing zone de conectividad híbrida en Microsoft Azure.
+
+La solución conecta una o más oficinas con Azure mediante VPN Site-to-Site, IPsec/IKEv2 y firewalls OPNsense.
+
+Está diseñada para oficinas cuya conexión de Internet utiliza una dirección IPv4 pública dinámica. Cada firewall OPNsense publica su dirección mediante Dynamic DNS y Azure identifica la oficina mediante un FQDN estable.
+
+La infraestructura se implementa utilizando:
+
+Azure Bicep
+Azure CLI
 Azure VPN Gateway
-Public IP estática
-|
-GatewaySubnet
-|
-Hub VNet
-10.100.0.0/24
-|
-+-------- Peering / Gateway Transit --------+
-| |
-Spoke Apps 01 Spoke Apps 02
-10.101.0.0/24 10.102.0.0/24
-El Azure VPN Gateway permanece como endpoint estable en Azure. Del lado de la oficina, el Local Network Gateway define el endpoint mediante el FQDN del DDNS. Azure documenta explícitamente que un Local Network Gateway puede representar el dispositivo on-premises mediante public IP o FQDN.
-2. Antes de configurar DDNS: comprobar CGNAT
-Este paso es crítico.
-Una IP pública dinámica está bien para este diseño. El problema es si OPNsense está detrás de CGNAT o de otro NAT del ISP.
-Paso 1. Verifica la WAN de OPNsense
-En OPNsense, revisa la dirección IPv4 de WAN.
-Busca algo equivalente a:
-Interfaces → Overview → WAN
-Supongamos:
-Plain Text
-WAN IPv4:
-187.x.x.x
-Paso 2. Compara con tu IP vista desde Internet
-Comprueba tu IP pública desde la misma conexión.
-Si tienes:
-Plain Text
-OPNsense WAN
-187.150.10.25
- 
-Internet Public IP
-187.150.10.25
-es una buena señal.
-Si tienes:
-Plain Text
-OPNsense WAN
-100.72.10.15
- 
-Internet Public IP
-187.150.10.25
-probablemente existe CGNAT.
-Especial atención al rango:
-Plain Text
-100.64.0.0/10
-En ese caso, habla con tu ISP antes de continuar.
-3. Configurar DDNS en OPNsense
-La documentación actual de OPNsense utiliza el plugin os-ddclient para Dynamic DNS. Se instala desde plugins y posteriormente los proveedores DDNS se configuran en Services → Dynamic DNS → Settings.
-Paso 1. Selecciona un nombre DNS
-Por ejemplo:
-Plain Text
-vpn-oficina.midominio.com
-No importa que cambie la IP.
-Lo importante es que:
-Plain Text
-vpn-oficina.midominio.com
-siempre apunte a la IP pública actual de OPNsense.
-Por ejemplo:
-Plain Text
-Lunes
- 
-vpn-oficina.midominio.com
-↓
-187.150.10.25
-El ISP cambia la IP:
-Plain Text
-Martes
- 
-vpn-oficina.midominio.com
-↓
-201.140.55.92
-El FQDN permanece igual.
-4. Instalar Dynamic DNS
-En OPNsense:
-System → Firmware → Plugins
-Busca:
-Plain Text
-os-ddclient
-e instálalo.
-Es precisamente el plugin que la documentación de OPNsense indica para mantener registros DNS cuando cambia la dirección del firewall.
-Después entra en:
-Services → Dynamic DNS → Settings
-5. Configuración general DDNS
-Activa:
-Plain Text
-Enable: ✓
-La documentación actual permite seleccionar backend ddclient o native; OPNsense recomienda probar el backend nativo cuando el proveedor utilizado sea compatible.
-Yo utilizaría:
-Plain Text
-Backend: native
-si tu proveedor está soportado.
-Después crea una cuenta DDNS.
-Conceptualmente:
-Plain Text
-Enabled: Yes
-Description: Azure VPN Office
-Service: <tu proveedor DNS>
-Username: <si aplica>
-Password/API Key: <token>
-Zone: midominio.com
-Hostname: vpn-oficina.midominio.com
-Check IP method: IPv4
-Interface: WAN
-Force SSL: Yes
-Los campos exactos dependen del proveedor. OPNsense admite autenticación mediante usuario/password o token/API key según el servicio.
-Seguridad
-Siempre que tu proveedor lo permita, utiliza un API token limitado exclusivamente a modificar ese registro DNS, en lugar de una contraseña con privilegios sobre toda tu zona.
-6. Validar DDNS antes de tocar Azure
-Desde otra computadora:
-Shell
-nslookup vpn-oficina.midominio.com
-o:
-Shell
-dig +short vpn-oficina.midominio.com
-Deberías obtener:
-Plain Text
-187.150.10.25
-Compara ese resultado con la WAN pública actual.
-Deben corresponder.
-7. Configurar Azure para utilizar el FQDN
-Aquí está el cambio fundamental respecto al diseño original.
-En Bicep tu Local Network Gateway debe utilizar el FQDN, no guardar como endpoint la IP temporal que tenga OPNsense en ese momento.
-Conceptualmente:
-Bicep
-resource localNetworkGateway 'Microsoft.Network/localNetworkGateways@...' = {
-name: 'lng-office-opnsense'
-location: location
- 
-properties: {
-fqdn: opnsenseFqdn
- 
-localNetworkAddressSpace: {
-addressPrefixes: officeAddressPrefixes
-}
-}
-}
-y:
-Plain Text
-opnsenseFqdn =
-vpn-oficina.midominio.com
-Tu red Azure podría ser:
-Ubicación	CIDRHub	10.100.0.0/24
-Apps01	10.101.0.0/24
-Apps02	10.102.0.0/24
-Shared	10.103.0.0/24
-Oficina	192.168.x.x/24
-Así se respeta tu requisito de no utilizar 192.168.x.x en Azure, pero puedes continuar utilizándolo en tus oficinas.
-8. Compatibilidad IPsec
-Azure VPN Gateway soporta VPN Site-to-Site mediante IPsec/IKE, y los gateways route-based actuales soportan IKEv2.
-Para este escenario utilizaría:
-Plain Text
-VPN:
- 
-Site-to-Site
-Route Based
-IKEv2
-PSK
-No empezaría habilitando BGP. Primero levantaría correctamente la VPN S2S con rutas estáticas y posteriormente evaluaría BGP si realmente lo necesitas.
-9. Obtener el endpoint Azure
-Una vez desplegado el Azure VPN Gateway necesitarás su IP pública.
-Por ejemplo:
-Plain Text
-20.x.x.x
-Esta será la Remote Address/Gateway de OPNsense.
-Observa la asimetría:
-Plain Text
-Azure conoce OPNsense por:
-vpn-oficina.midominio.com
- 
-OPNsense conoce Azure por:
-20.x.x.x
-Eso está bien.
-10. Configurar IPsec en OPNsense
-Las versiones actuales de OPNsense gestionan IPsec mediante Connections basadas en swanctl.conf/strongSwan. La terminología difiere de las antiguas pantallas Phase 1/Phase 2, aunque conceptualmente siguen existiendo el establecimiento IKE y las CHILD SAs.
-Accede a:
-VPN → IPsec → Connections
-Y habilita IPsec.
-11. Crear el Pre-Shared Key
-Ve a:
-VPN → IPsec → Pre-Shared Keys
-La documentación recomienda definir específicamente las identidades cuando sea posible para evitar que una misma PSK resulte aplicable innecesariamente a varias conexiones.
-Genera una PSK criptográficamente fuerte.
-Por ejemplo:
-Plain Text
-32+ caracteres aleatorios
- 
-No utilices ejemplos como:
-Plain Text
-Azure123
-myvpnpassword
-empresa2026
-La PSK introducida en OPNsense debe ser exactamente la misma que configures en la conexión de Azure.
-12. Crear la conexión IKE
-En:
-VPN → IPsec → Connections
-crea una nueva conexión.
-Conceptualmente:
-Plain Text
-Description:
-Azure-Hub-VPN
- 
-Version:
-IKEv2
- 
-Remote address:
-<IP pública de Azure VPN Gateway>
-Para el endpoint local procura no fijar como identidad la IP WAN dinámica si no es necesario.
-Tu WAN puede cambiar.
-13. Parámetros criptográficos
-Si aplicas la política personalizada que definimos en tu arquitectura de Azure, mantén idénticas las propuestas a ambos lados.
-Base inicial:
-IKE
-Plain Text
-IKE Version: IKEv2
- 
-Encryption: AES-256
-Integrity: SHA-256
-DH Group: 14
-ESP/IPsec
-Plain Text
-Encryption: AES-256
-Integrity: SHA-256
-PFS: Group 14
-Antes del despliegue definitivo, haz que tu Bicep utilice exactamente estos mismos algoritmos en la ipsecPolicy. No permitas que Copilot invente los nombres de las enumeraciones de Azure.
-14. Configurar las redes
-Supongamos que la oficina utiliza:
-Plain Text
-192.168.10.0/24
- 
-Y Azure:
-Plain Text
-10.100.0.0/24
-10.101.0.0/24
-10.102.0.0/24
-10.103.0.0/24
-En el CHILD SA/Phase 2 conceptualmente tendrás:
-Plain Text
-Local:
- 
-192.168.10.0/24
-Remote:
-Plain Text
-10.100.0.0/24
-10.101.0.0/24
-10.102.0.0/24
-10.103.0.0/24
-La documentación de OPNsense muestra este mismo concepto: en una conexión IPsec policy-based se definen las redes Local y Remote que generan las políticas del túnel.
-15. Firewall de OPNsense
-No basta con levantar el túnel.
-También necesitas permitir el tráfico.
-Revisa:
-Firewall → Rules → IPsec
-La documentación de OPNsense indica que, una vez levantado el túnel, deben añadirse las políticas de firewall necesarias para aceptar tráfico a través de IPsec.
-No recomiendo empezar con:
-Plain Text
-Allow any → any
-Permite únicamente tus redes y servicios.
-Por ejemplo:
-Plain Text
-Source:
-192.168.10.0/24
- 
-Destination:
-10.101.0.0/24
- 
-TCP:
-443
-Después amplías según las necesidades reales de las aplicaciones.
-16. NAT
-Asegúrate de que:
-Plain Text
-192.168.x.x → 10.x.x.x
-no se NATee hacia la IP WAN.
-El tráfico VPN debe conservar sus direcciones privadas en este escenario.
-Comprueba tus reglas de Outbound NAT y crea las excepciones correspondientes si tu configuración lo requiere.
-17. Levantar la VPN
-En OPNsense revisa:
-VPN → IPsec → Status Overview
-Las versiones actuales también disponen de Security Association Database y Security Policy Database, útiles para diagnosticar IPsec.
-Debes validar primero:
-Plain Text
-IKE SA: ESTABLISHED
-y después las asociaciones CHILD/IPsec.
-18. Comprobar Azure
-En Azure:
-Shell
-az network vpn-connection show \
---resource-group APPSEROGERVPN \
---name conn-hub-to-office-opnsense
-Y puedes consultar el estado de la conexión.
-El objetivo final es:
-Plain Text
-connectionStatus:
-Connected
-19. Probar tráfico real
-Haz las pruebas progresivamente.
-Primero:
-Plain Text
-Oficina
-↓
-Hub
-Después:
-Plain Text
-Oficina
-↓
-Hub
-↓
-Spoke
-Por ejemplo:
-Plain Text
-192.168.10.100
-↓
-10.101.0.10
-Esto permite diferenciar problemas de:
-IKE/IPsec
-routing
+Azure Virtual Network
 VNet Peering
 Gateway Transit
-NSG
-firewall OPNsense
-firewall del servidor
-20. ¿Qué sucede cuando cambia la IP?
-Este es el caso realmente interesante.
-Imagina:
-Plain Text
-10:00
- 
-OPNsense:
-187.150.10.25
- 
-DNS:
-vpn-oficina.midominio.com
-→ 187.150.10.25
-El ISP reinicia el enlace.
-Ahora:
-Plain Text
-10:15
- 
-OPNsense:
-187.150.44.91
-DDNS detecta el cambio y actualiza:
-Plain Text
-vpn-oficina.midominio.com
-→ 187.150.44.91
-El plugin DDNS de OPNsense está diseñado precisamente para actualizar el registro DNS cuando cambia la dirección del firewall.
-La asociación IPsec anterior dejará de ser válida y se necesitará una nueva negociación.
-Por eso recomiendo configurar correctamente:
-DPD
-reconexión/rekey
-DDNS frecuente
-TTL DNS razonablemente corto
-OPNsense como iniciador capaz de restablecer el túnel
-No asumiría failover instantáneo cuando cambia la IP.
-21. Una limitación importante
-Microsoft Learn advierte de otra característica relevante: no puedes convertir directamente un Local Network Gateway existente entre endpoint IP y endpoint FQDN. Para cambiar el tipo, hay que eliminar las conexiones asociadas, crear nuevamente el Local Network Gateway con el nuevo tipo de endpoint y recrear las conexiones. Por ello, si sabes que tu dirección es dinámica, conviene implementar FQDN desde el primer despliegue.
-Esto refuerza mi recomendación de modificar ahora el Bicep, antes del deployment.
-22. Diseño que recomiendo finalmente
-Para tu suscripción:
-Plain Text
-55318ed6-5d8a-4bd2-889f-10e502960c28
-y:
-Plain Text
-APPSEROGERVPN
-dejaría el modelo así:
-Plain Text
-┌ Office 01
-│ OPNsense
-│ Dynamic IP
-│ DDNS
-│ vpn-office01.domain
-│
-│ IPsec/IKEv2
-│
-Azure VPN Gateway
-│
-HUB /24
-10.100.0.0
-│
-┌──────────┼──────────┐
-│ │ │
-Peering Peering Peering
-│ │ │
-10.101.0.0 10.102.0.0 10.103.0.0
-/24 /24 /24
-Y para una segunda oficina:
-Plain Text
-Office 02
+Azure Network Security Groups
 OPNsense
-Dynamic IP
-↓
-vpn-office02.domain
-↓
-Local Network Gateway #2
-↓
-VPN Connection #2
-↓
-MISMO Azure VPN Gateway
-Azure VPN Gateway permite múltiples conexiones hacia un mismo gateway, compartiendo entre ellas la capacidad disponible del gateway.
-Veredicto
-Sí recomiendo continuar con el diseño FQDN/DDNS. Está alineado con el modelo soportado de Azure VPN Gateway, donde el Local Network Gateway puede representar el dispositivo on-premises mediante IP pública o FQDN.
-Antes de desplegarlo, validaría estas cuatro cosas:
-OPNsense tiene salida mediante una IPv4 pública utilizable y no CGNAT problemático.
-El DDNS resuelve correctamente desde Internet.
-Azure se crea con fqdn, no tomando la IP dinámica actual como gatewayIpAddress.
-Las propuestas IKE/IPsec de Azure y OPNsense coinciden exactamente.
+Dynamic DNS
+IPsec/IKEv2
+Azure Key Vault opcional
+Azure Firewall opcional
+Azure Bastion opcional
+Azure Private DNS opcional
+Entorno objetivo
+Configuración	Valor
+Subscription ID	55318ed6-5d8a-4bd2-889f-10e502960c28
+Resource Group	APPSEROGERVPN
+Región predeterminada	Mexico Central
+Herramienta IaC	Bicep
+Topología	Hub-Spoke
+Conectividad híbrida	Azure VPN Gateway
+VPN	Site-to-Site
+Protocolo	IPsec/IKEv2
+Endpoint de oficina	FQDN mediante DDNS
+El Resource Group debe existir antes del despliegue. La solución no debe crear ni eliminar el Resource Group APPSEROGERVPN.
+
+Objetivos
+La solución tiene los siguientes objetivos:
+
+Centralizar la conectividad híbrida en una Hub VNet.
+Conectar las oficinas mediante Azure VPN Gateway.
+Compartir el VPN Gateway con los Spokes mediante Gateway Transit.
+Aislar las aplicaciones en redes Spoke independientes.
+Evitar el uso de rangos 192.168.x.x dentro de Azure.
+Permitir que las redes de oficina continúen utilizando rangos 192.168.x.x.
+Soportar IP pública dinámica en las oficinas mediante DDNS.
+Evitar el almacenamiento de secretos dentro del repositorio.
+Permitir agregar nuevas oficinas y Spokes mediante parámetros.
+Mantener Azure Firewall y Azure Bastion como componentes opcionales.
+Arquitectura
+flowchart LR
+    subgraph Office["Oficina"]
+        LAN["Office LAN<br/>192.168.x.0/24"]
+        OPN["OPNsense<br/>Dynamic Public IP"]
+        DDNS["DDNS FQDN<br/>vpn-office.example.com"]
+
+        LAN --> OPN
+        OPN --> DDNS
+    end
+
+    Internet["Internet"]
+    VPN["Azure VPN Gateway<br/>Route-Based / IKEv2"]
+
+    subgraph Azure["Microsoft Azure"]
+        subgraph Hub["Hub VNet<br/>10.100.0.0/24"]
+            GatewaySubnet["GatewaySubnet"]
+            Shared["SharedServicesSubnet"]
+            Management["NetworkManagementSubnet"]
+            FirewallSubnet["AzureFirewallSubnet"]
+            BastionSubnet["AzureBastionSubnet"]
+        end
+
+        Spoke1["Apps Spoke 01<br/>10.101.0.0/24"]
+        Spoke2["Apps Spoke 02<br/>10.102.0.0/24"]
+        Spoke3["Shared Spoke<br/>10.103.0.0/24"]
+    end
+
+    DDNS --> Internet
+    Internet -->|IPsec S2S| VPN
+    VPN --> GatewaySubnet
+
+    Hub -->|Peering + Gateway Transit| Spoke1
+    Hub -->|Peering + Gateway Transit| Spoke2
+    Hub -->|Peering + Gateway Transit| Spoke3
+Direccionamiento IP
+Redes Azure
+Red	Address space
+Hub VNet	10.100.0.0/24
+Apps Spoke 01	10.101.0.0/24
+Apps Spoke 02	10.102.0.0/24
+Shared Spoke	10.103.0.0/24
+Subredes del Hub
+Subred	Prefijo	Uso
+GatewaySubnet	10.100.0.0/27	Azure VPN Gateway
+AzureBastionSubnet	10.100.0.32/26	Azure Bastion opcional
+AzureFirewallSubnet	10.100.0.96/26	Azure Firewall opcional
+SharedServicesSubnet	10.100.0.160/27	Servicios compartidos
+NetworkManagementSubnet	10.100.0.192/27	Administración
+Subredes de los Spokes
+VNet	Subred	Prefijo
+Apps Spoke 01	snet-apps	10.101.0.0/25
+Apps Spoke 01	snet-private-endpoints	10.101.0.128/26
+Apps Spoke 02	snet-apps	10.102.0.0/25
+Apps Spoke 02	snet-private-endpoints	10.102.0.128/26
+Shared Spoke	snet-shared	10.103.0.0/25
+Shared Spoke	snet-private-endpoints	10.103.0.128/26
+Restricción de direccionamiento
+Azure no debe utilizar rangos que comiencen con:
+
+192.168
+Estos rangos están reservados para las oficinas.
+
+Ejemplos válidos on-premises:
+
+192.168.10.0/24
+192.168.20.0/24
+192.168.30.0/24
+Topología Hub-Spoke
+La Hub VNet concentra los servicios compartidos de conectividad.
+
+El Azure VPN Gateway se despliega exclusivamente en GatewaySubnet.
+
+Los Spokes se conectan al Hub mediante peerings bidireccionales.
+
+Peering Hub hacia Spoke
+allowVirtualNetworkAccess: true
+allowForwardedTraffic: true
+allowGatewayTransit: true
+useRemoteGateways: false
+Peering Spoke hacia Hub
+allowVirtualNetworkAccess: true
+allowForwardedTraffic: true
+allowGatewayTransit: false
+useRemoteGateways: true
+Gateway Transit
+Gateway Transit permite que las VNets Spoke utilicen el Azure VPN Gateway desplegado en el Hub.
+
+Esto evita desplegar un VPN Gateway separado por cada Spoke.
+
+La ruta esperada es:
+
+Oficina
+  → OPNsense
+  → IPsec/IKEv2
+  → Azure VPN Gateway
+  → Hub VNet
+  → VNet Peering
+  → Spoke VNet
+Limitación Spoke-to-Spoke
+VNet Peering no proporciona tránsito automático entre dos Spokes.
+
+El siguiente flujo no queda habilitado automáticamente:
+
+Spoke 01
+  → Hub
+  → Spoke 02
+Para implementar comunicación Spoke-to-Spoke debe utilizarse una de estas alternativas:
+
+Azure Firewall.
+Network Virtual Appliance.
+Peerings directos controlados.
+Otra solución explícita de tránsito.
+Azure VPN Gateway
+Configuración predeterminada:
+
+Propiedad	Valor
+Nombre	vpngw-hub-connectivity
+Gateway type	VPN
+VPN type	RouteBased
+SKU	VpnGw1AZ
+Generation	Generation2
+Active-active	Deshabilitado
+BGP	Deshabilitado
+Public IP SKU	Standard
+Public IP allocation	Static
+IKE	IKEv2
+El SKU y otras propiedades deben poder modificarse mediante parámetros.
+
+Diseño para IP pública dinámica
+La dirección pública de OPNsense puede cambiar cuando:
+
+El ISP renueva la sesión.
+Se reinicia el módem.
+Se reinicia OPNsense.
+Expira una concesión.
+Cambia la infraestructura del ISP.
+Azure no debe almacenar esa dirección temporal como configuración permanente.
+
+Cada oficina debe publicar un nombre estable, por ejemplo:
+
+vpn-office-mexico.example.com
+Aunque la dirección cambie:
+
+Antes:
+
+vpn-office-mexico.example.com
+→ 198.51.100.20
+
+Después:
+
+vpn-office-mexico.example.com
+→ 198.51.100.95
+Azure continúa utilizando:
+
+vpn-office-mexico.example.com
+Las direcciones del ejemplo pertenecen a rangos de documentación y no deben utilizarse como configuración de producción.
+
+Local Network Gateway
+Cada oficina se representa en Azure mediante un Local Network Gateway.
+
+Una oficina dinámica debe utilizar:
+
+fqdn: vpn-office-mexico.example.com
+No debe configurarse simultáneamente:
+
+fqdn
+gatewayIpAddress
+El despliegue debe seleccionar una única modalidad:
+
+fqdn para direcciones dinámicas.
+ip para direcciones estáticas.
+Flujo cuando cambia la IP pública
+El comportamiento esperado es:
+
+El ISP cambia la dirección IPv4 pública.
+OPNsense detecta la nueva dirección WAN.
+El cliente DDNS actualiza el registro DNS.
+El FQDN permanece sin cambios.
+El registro DNS empieza a resolver la nueva dirección.
+La asociación IKE anterior puede dejar de ser válida.
+OPNsense renegocia la conexión IPsec.
+Azure restaura la conectividad con la oficina.
+La recuperación puede tardar debido a:
+
+DNS TTL.
+Caché DNS.
+DPD.
+IKE SA lifetime.
+CHILD SA lifetime.
+Rekey.
+Resolución del FQDN.
+Tiempo de actualización del proveedor DDNS.
+La reconexión no debe considerarse instantánea.
+
+Dynamic DNS en OPNsense
+Requisitos
+Antes de configurar DDNS se necesita:
+
+Un proveedor DNS o DDNS.
+Un hostname.
+Una cuenta o API token.
+Acceso administrativo a OPNsense.
+Una IPv4 pública utilizable.
+Instalar el plugin
+En OPNsense:
+
+System
+  → Firmware
+  → Plugins
+Buscar:
+
+os-ddclient
+Instalar el plugin.
+
+Crear la cuenta DDNS
+Ir a:
+
+Services
+  → Dynamic DNS
+  → Settings
+Crear una entrada con valores similares a:
+
+Campo	Valor
+Enabled	Yes
+Description	Azure VPN Office
+Service	Proveedor seleccionado
+Username	Si aplica
+Password/API key	Token del proveedor
+Zone	Dominio correspondiente
+Hostname	FQDN de la oficina
+Check IP method	IPv4
+Interface	WAN
+Force SSL	Yes
+Se recomienda utilizar el backend nativo cuando el proveedor sea compatible.
+
+Seguridad del token
+El API token debería:
+
+Modificar solamente la zona requerida.
+Preferentemente modificar solamente el registro DDNS.
+No conceder permisos administrativos completos.
+No almacenarse en Git.
+No aparecer en documentación o logs compartidos.
+Validación
+Desde una ubicación externa:
+
+dig +short vpn-office-mexico.example.com
+Alternativas:
+
+host vpn-office-mexico.example.com
+nslookup vpn-office-mexico.example.com
+El resultado debe coincidir con la IPv4 pública del firewall.
+
+Validación de CGNAT
+Una IP dinámica sí puede utilizarse.
+
+CGNAT puede impedir o dificultar la conexión.
+
+Compara:
+
+Dirección IPv4 WAN mostrada por OPNsense.
+Dirección IPv4 observada desde Internet.
+Si no coinciden, investiga:
+
+CGNAT.
+Double NAT.
+Modem/router del ISP.
+NAT upstream.
+El rango:
+
+100.64.0.0/10
+se utiliza comúnmente para CGNAT.
+
+También deben investigarse direcciones WAN privadas:
+
+10.0.0.0/8
+172.16.0.0/12
+192.168.0.0/16
+Alternativas frente a CGNAT
+Solicitar una IPv4 pública al ISP.
+Solicitar una IPv4 estática.
+Solicitar salida de CGNAT.
+Configurar bridge mode.
+Configurar IP passthrough.
+Revisar NAT-T.
+Evaluar otra solución de conectividad.
+Configuración IPsec en OPNsense
+Parámetros recomendados
+IKE
+Propiedad	Valor
+Versión	IKEv2
+Encryption	AES256
+Integrity	SHA256
+DH Group	14
+Autenticación	Pre-Shared Key
+ESP/IPsec
+Propiedad	Valor
+Encryption	AES256
+Integrity	SHA256
+PFS	Group 14
+Mode	Tunnel
+Los valores deben coincidir exactamente con la política configurada en Azure.
+
+Crear el PSK
+Ir a:
+
+VPN
+  → IPsec
+  → Pre-Shared Keys
+Crear una clave independiente para la oficina.
+
+La clave debe:
+
+Ser criptográficamente aleatoria.
+Tener longitud suficiente.
+Ser distinta para cada oficina.
+Guardarse en Azure Key Vault cuando sea posible.
+No almacenarse en este repositorio.
+Crear la conexión
+Ir a:
+
+VPN
+  → IPsec
+  → Connections
+Crear una conexión con:
+
+Campo	Valor
+Description	Azure Hub VPN
+IKE version	IKEv2
+Remote address	IP pública del Azure VPN Gateway
+Authentication	Pre-Shared Key
+Encryption	AES256
+Integrity	SHA256
+DH Group	14
+Los nombres exactos pueden variar según la versión de OPNsense.
+
+Redes locales
+Ejemplo:
+
+192.168.10.0/24
+192.168.20.0/24
+Redes remotas
+10.100.0.0/24
+10.101.0.0/24
+10.102.0.0/24
+10.103.0.0/24
+DPD y reconexión
+Habilitar Dead Peer Detection.
+
+El objetivo es detectar asociaciones que hayan dejado de funcionar y permitir una nueva negociación.
+
+También deben revisarse:
+
+Rekey.
+IKE lifetime.
+CHILD SA lifetime.
+NAT Traversal.
+MOBIKE, según compatibilidad y diseño.
+Comportamiento initiator/responder.
+Reglas de firewall
+Después de crear la VPN deben configurarse reglas en:
+
+Firewall
+  → Rules
+  → IPsec
+No debe mantenerse una regla final:
+
+Any → Any
+Ejemplo de acceso limitado:
+
+Source:
+192.168.10.0/24
+
+Destination:
+10.101.0.0/24
+
+Protocol:
+TCP
+
+Destination port:
+443
+ICMP puede habilitarse temporalmente para diagnóstico.
+
+Outbound NAT
+El tráfico con destino a Azure no debe traducirse hacia la IP WAN de OPNsense.
+
+Se deben revisar las reglas de Outbound NAT para excluir:
+
+192.168.10.0/24 → 10.100.0.0/24
+192.168.10.0/24 → 10.101.0.0/24
+192.168.10.0/24 → 10.102.0.0/24
+192.168.10.0/24 → 10.103.0.0/24
+El tráfico debe conservar sus direcciones privadas originales.
+
+Manejo de secretos
+No deben almacenarse PSK dentro de:
+
+Bicep.
+Archivos de parámetros.
+Git.
+README.
+Outputs.
+Logs.
+Historial de comandos.
+Alternativa recomendada
+Utilizar un Azure Key Vault existente.
+
+Ejemplo de nombres:
+
+vpn-office-mexico-psk
+vpn-office-02-psk
+Cada oficina debe utilizar una clave diferente.
+
+Rotación
+Para rotar una clave:
+
+Crear una nueva PSK.
+Actualizar el secreto de Key Vault.
+Actualizar OPNsense durante una ventana controlada.
+Actualizar la conexión en Azure.
+Iniciar una nueva negociación.
+Validar tráfico.
+Revocar la clave anterior.
+La rotación puede causar una interrupción breve.
+
+Seguridad en Azure
+La solución debe aplicar las siguientes medidas:
+
+Sin RDP desde Internet.
+Sin SSH desde Internet.
+Sin Public IPs para las aplicaciones.
+Public IP Standard para el VPN Gateway.
+NSGs limitados por origen, destino y puerto.
+PSK fuera del código.
+Tags para identificar recursos.
+Azure Firewall deshabilitado por defecto.
+Azure Bastion deshabilitado por defecto.
+Private Endpoints preparados.
+Principio de mínimo privilegio.
+Prerrequisitos
+Se necesita:
+
+Azure CLI.
+Bicep CLI.
+Bash.
+Permisos sobre APPSEROGERVPN.
+Dynamic DNS configurado.
+FQDN resolviendo desde Internet.
+PSK por oficina.
+Azure Key Vault opcional.
+OPNsense actualizado.
+Red on-premises sin solapamientos con Azure.
+Comprobar sesión:
+
+az account show
+Seleccionar la suscripción:
+
+az account set \
+  --subscription "55318ed6-5d8a-4bd2-889f-10e502960c28"
+Comprobar el Resource Group:
+
+az group show \
+  --subscription "55318ed6-5d8a-4bd2-889f-10e502960c28" \
+  --name "APPSEROGERVPN"
+Permisos RBAC
+Como mínimo, el operador necesita permisos para administrar recursos de red dentro del Resource Group.
+
+Un rol como Network Contributor puede ser suficiente para los recursos de red.
+
+Pueden requerirse permisos adicionales para:
+
+Leer secretos de Key Vault.
+Crear asignaciones de rol.
+Configurar diagnósticos.
+Acceder a Log Analytics.
+Ejecutar Network Watcher.
+Se debe aplicar el mínimo privilegio.
+
+Configuración
+Copiar el archivo de ejemplo:
+
+cp main.parameters.example.json main.parameters.json
+Editar:
+
+main.parameters.json
+Reemplazar:
+
+FQDN de cada oficina.
+Prefijos on-premises.
+Región.
+Tags.
+Puertos.
+Parámetros BGP.
+Configuración de recursos opcionales.
+No incluir el PSK.
+
+Validación
+Ejecutar:
+
+chmod +x scripts/*.sh
+Después:
+
+./scripts/validate.sh
+La validación debe comprobar:
+
+Azure CLI.
+Bicep.
+Sesión activa.
+Suscripción.
+Resource Group.
+Compilación.
+Rangos.
+Solapamientos.
+FQDN.
+Resolución DNS.
+Placeholders.
+Parámetros requeridos.
+Comprobación DDNS
+./scripts/check-ddns.sh \
+  vpn-office-mexico.example.com
+El script no debe modificar Azure ni DNS.
+
+What-if
+Antes de desplegar:
+
+./scripts/what-if.sh
+Revisar especialmente:
+
+Recursos que serán creados.
+Recursos que serían eliminados.
+Cambios en VNets.
+Cambios en peerings.
+Cambios en VPN Gateway.
+Cambios en Local Network Gateways.
+Cambios en conexiones VPN.
+No continuar si aparecen eliminaciones inesperadas.
+
+Despliegue
+./scripts/deploy.sh
+El script debe:
+
+Verificar la suscripción.
+Verificar el Resource Group.
+Ejecutar validación.
+Ejecutar what-if.
+Solicitar confirmación.
+Obtener los secretos de forma segura.
+Ejecutar el deployment.
+Mostrar outputs no sensibles.
+Validación posterior
+Estado de conexiones
+./scripts/check-vpn-status.sh
+Pruebas
+./scripts/test-connectivity.sh
+Validar:
+
+Resolución DDNS.
+Azure VPN Gateway.
+VPN Connection.
+IKE SA.
+CHILD SA.
+Bytes enviados y recibidos.
+Peerings.
+Effective routes.
+NSGs.
+Reglas OPNsense.
+Outbound NAT.
+Aplicaciones.
+Prueba progresiva
+Realizar las pruebas en este orden:
+
+Oficina → Hub
+Oficina → Spoke
+Spoke → Oficina
+Aplicación → Servicio autorizado
+Esto facilita identificar si el problema está en:
+
+DDNS.
+IKE.
+IPsec.
+Routing.
+Peering.
+Gateway Transit.
+NSG.
+Firewall.
+NAT.
+Sistema operativo.
+Aplicación.
+Monitoreo
+Se recomienda supervisar:
+
+Estado del Azure VPN Gateway.
+Estado de las conexiones.
+Ingress bytes.
+Egress bytes.
+Disponibilidad de DDNS.
+Cambios en la IPv4 pública.
+Logs IPsec de OPNsense.
+DPD.
+Rekey.
+Fallos de autenticación.
+Cambios en peerings.
+Agregar una oficina
+Para agregar una oficina:
+
+Configurar DDNS en OPNsense.
+Verificar que el FQDN resuelva.
+Definir prefijos sin solapamientos.
+Crear un PSK independiente.
+Guardar el PSK en Key Vault.
+Agregar la oficina al array offices.
+Ejecutar validación.
+Ejecutar what-if.
+Desplegar.
+Configurar IPsec en OPNsense.
+Crear reglas.
+Validar tráfico.
+No se necesita otro Azure VPN Gateway mientras el SKU, límites y capacidad sean suficientes.
+
+Agregar un Spoke
+Para agregar un Spoke:
+
+Seleccionar un bloque /24 no utilizado.
+Agregarlo al array de Spokes.
+Definir subredes.
+Definir reglas NSG.
+Verificar solapamientos.
+Ejecutar validación.
+Ejecutar what-if.
+Desplegar.
+Comprobar peerings.
+Comprobar Gateway Transit.
+BGP
+BGP está deshabilitado por defecto.
+
+Antes de habilitarlo se debe definir:
+
+ASN de Azure.
+ASN de OPNsense.
+BGP peer IP de Azure.
+BGP peer IP on-premises.
+Rutas anunciadas.
+Filtros.
+Prevención de propagación no deseada.
+Para el primer despliegue se recomienda validar conectividad con rutas estáticas.
+
+Azure Firewall
+Azure Firewall está deshabilitado por defecto.
+
+Cuando se habilite:
+
+Debe desplegarse en AzureFirewallSubnet.
+Debe utilizar una Firewall Policy.
+Las UDR deben usar la IP privada real del firewall.
+Debe documentarse el flujo Spoke-to-Spoke.
+Debe evitarse una regla excesivamente permisiva.
+Debe revisarse el efecto sobre rutas anunciadas por VPN Gateway.
+Azure Bastion
+Azure Bastion está deshabilitado por defecto.
+
+Cuando se habilite:
+
+Debe usar AzureBastionSubnet.
+Debe utilizar Public IP Standard.
+No debe modificar GatewaySubnet.
+Debe evitar la exposición directa de RDP o SSH.
+Private DNS
+Las zonas Private DNS son opcionales.
+
+Ejemplos:
+
+privatelink.azurewebsites.net
+privatelink.blob.core.windows.net
+privatelink.vaultcore.azure.net
+Solo deben crearse las zonas necesarias para los servicios utilizados.
+
+Troubleshooting
+El FQDN no resuelve
+Comprobar:
+
+Servicio DDNS.
+API token.
+Hostname.
+Zone.
+WAN.
+Método de detección de IP.
+Logs de os-ddclient.
+TTL.
+Propagación DNS.
+IKE no se establece
+Comprobar:
+
+IP pública de Azure.
+PSK.
+IKEv2.
+AES256.
+SHA256.
+DH Group 14.
+UDP 500.
+UDP 4500.
+NAT-T.
+CGNAT.
+Identidades IPsec.
+IKE funciona pero no hay CHILD SA
+Comprobar:
+
+Redes locales.
+Redes remotas.
+Selectores.
+ESP.
+PFS14.
+Lifetimes.
+Address spaces en Azure Local Network Gateway.
+El túnel está conectado pero no hay tráfico
+Comprobar:
+
+Reglas IPsec.
+Reglas LAN.
+NSGs.
+UDR.
+Effective routes.
+Outbound NAT.
+Firewall del servidor.
+Gateway Transit.
+Peering.
+Puertos de la aplicación.
+Funciona Hub pero no Spoke
+Comprobar:
+
+Peering bidireccional.
+allowGatewayTransit en el Hub.
+useRemoteGateways en el Spoke.
+Prefijo del Spoke en OPNsense.
+NSG del Spoke.
+Rutas efectivas.
+La VPN falla después de cambiar la IP
+Comprobar:
+
+DDNS actualizado.
+Nueva dirección resuelta.
+DNS TTL.
+Caché DNS.
+DPD.
+Estado de IKE SA.
+Rekey.
+NAT-T.
+Logs de OPNsense.
+Renegociación del túnel.
+Rollback
+Antes de desplegar:
+
+Guardar el resultado de what-if.
+Revisar cambios destructivos.
+Confirmar que no se modificarán recursos existentes ajenos a la solución.
+Mantener los parámetros anteriores.
+Documentar la versión desplegada.
+No eliminar el Resource Group como mecanismo de rollback.
+
+Eliminación segura
+El script de eliminación debe:
+
+Verificar la suscripción.
+Mostrar recursos administrados.
+Solicitar confirmación.
+Exigir el nombre del Resource Group.
+Eliminar recursos en orden de dependencia.
+No eliminar APPSEROGERVPN.
+No eliminar recursos que no pertenezcan a la solución.
+Costos
+Los recursos con costo pueden incluir:
+
+Azure VPN Gateway.
+Public IP.
+Azure Firewall opcional.
+Azure Bastion opcional.
+Log Analytics.
+Transferencia de datos.
+Key Vault.
+Network Watcher, según funcionalidad.
+No se incluyen precios fijos porque dependen de:
+
+Región.
+SKU.
+Horas de operación.
+Transferencia.
+Consumo.
+Retención de logs.
+Consultar Azure Pricing Calculator antes del despliegue.
+
+Limitaciones
+El cambio de IP pública puede producir una interrupción temporal.
+DDNS no corrige problemas de CGNAT.
+Los cachés DNS pueden retrasar la recuperación.
+Spoke-to-Spoke no es transitivo automáticamente.
+Los límites y rendimiento dependen del SKU del VPN Gateway.
+Las pantallas de OPNsense pueden variar entre versiones.
+Cambiar un Local Network Gateway de endpoint IP a FQDN puede requerir recrear las conexiones asociadas.
+Una VPN por Internet no ofrece el mismo SLA o predictibilidad que un circuito privado.
+Datos pendientes
+Antes del despliegue deben definirse:
+
+FQDN DDNS real por oficina.
+Proveedor DDNS.
+API token del proveedor.
+Prefijos de oficina.
+PSK independiente.
+Key Vault.
+Nombre de cada secreto.
+Región definitiva.
+Owner.
+Environment.
+Cost center.
+Puertos autorizados.
+BGP habilitado o deshabilitado.
+ASN.
+BGP peer IP.
+Azure Firewall habilitado o deshabilitado.
+Azure Bastion habilitado o deshabilitado.
+Zonas Private DNS.
+Hosts de prueba.
+Referencias
+Azure VPN Gateway.
+Azure Local Network Gateway.
+Azure Hub-Spoke network topology.
+Azure VNet Peering y Gateway Transit.
+OPNsense Dynamic DNS.
+OPNsense IPsec Connections.
+OPNsense IPsec Security Associations.
