@@ -1,0 +1,111 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "resourcePrefix": {
+      "value": "CHANGE-ME"
+    },
+    "location": {
+      "value": "mexicocentral"
+    },
+    "tags": {
+      "value": {
+        "Solution": "hybrid-vpn-bicep",
+        "Environment": "CHANGE-ME",
+        "Owner": "CHANGE-ME",
+        "CostCenter": "CHANGE-ME"
+      }
+    },
+    "hubAddressPrefix": {
+      "value": "10.100.0.0/24"
+    },
+    "gatewaySubnetPrefix": {
+      "value": "10.100.0.0/27"
+    },
+    "sharedServicesSubnetPrefix": {
+      "value": "10.100.0.192/27"
+    },
+    "networkManagementSubnetPrefix": {
+      "value": "10.100.0.224/27"
+    },
+    "vpnGatewaySku": {
+      "value": "VpnGw1AZ"
+    },
+    "vpnGatewayGeneration": {
+      "value": "Generation2"
+    },
+    "enableBgp": {
+      "value": false
+    },
+    "azureBgpAsn": {
+      "value": 65515
+    },
+    "offices": {
+      "value": [
+        {
+          "name": "office-01",
+          "fqdn": "vpn-office-01.example.invalid",
+          "addressPrefixes": [
+            "192.168.10.0/24"
+          ],
+          "pskSecretName": "CHANGE-ME-office-01-psk",
+          "asn": 65010,
+          "bgpPeerIp": "169.254.21.2"
+        }
+      ]
+    },
+    "spokes": {
+      "value": [
+        {
+          "name": "apps-01",
+          "addressPrefix": "10.101.0.0/24",
+          "subnets": [
+            {
+              "name": "snet-apps",
+              "addressPrefix": "10.101.0.0/25"
+            },
+            {
+              "name": "snet-private-endpoints",
+              "addressPrefix": "10.101.0.128/26"
+            }
+          ]
+        },
+        {
+          "name": "apps-02",
+          "addressPrefix": "10.102.0.0/24",
+          "subnets": [
+            {
+              "name": "snet-apps",
+              "addressPrefix": "10.102.0.0/25"
+            },
+            {
+              "name": "snet-private-endpoints",
+              "addressPrefix": "10.102.0.128/26"
+            }
+          ]
+        }
+      ]
+    },
+    "authorizedInboundRules": {
+      "value": []
+    },
+    "keyVaultName": {
+      "value": "CHANGE-ME"
+    },
+    "enableFirewall": {
+      "value": false
+    },
+    "firewallSubnetPrefix": {
+      "value": "10.100.0.128/26"
+    },
+    "enableBastion": {
+      "value": false
+    },
+    "bastionSubnetPrefix": {
+      "value": "10.100.0.64/26"
+    },
+    "privateDnsZones": {
+      "value": []
+    }
+  }
+}

@@ -1,0 +1,6 @@
+# Local deployment parameters may contain non-secret environment metadata.
+main.parameters.json
+
+# Bicep compilation artifacts.
+main.json
+modules/*.json
