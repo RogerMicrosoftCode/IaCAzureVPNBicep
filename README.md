@@ -222,6 +222,21 @@ Los rangos de Bastion y Firewall solo se incorporan a la VNet Hub cuando se habi
 
 Consulta de solo lectura del 22/10/2026 en la suscripción `662141d0-0308-4187-b46b-db1e9466b5ac` (`MCAPS-Hybrid-REQ-116668-2025-rooliva`, tenant `16b3c013-d300-468d-ac64-7eda0820b6d3`): `vnet-superag-eastus` en RG `superag` usa `10.0.0.0/16`; `vnet-finopsazure` en RG `finopsazure` usa `10.30.0.0/16`. Ambas sin peerings. No se encontraron gateways VPN, LNG, hubs o sitios Virtual WAN. No hay solapamiento con los tres `/24` propuestos ni con la LAN de oficina; **no se renumeran ni se conectan esas VNets existentes**.
 
+### Destino confirmado y validación previa al despliegue
+
+El destino confirmado es el Resource Group existente `APPSEROGERVPN`, en `mexicocentral`, suscripción `55318ed6-5d8a-4bd2-889f-10e502960c28` (`MCAPS-Hybrid-REQ-53739-2023-rooliva`), en el mismo tenant. La suscripción del inventario anterior no es el destino del despliegue.
+
+Consulta de solo lectura del 22/10/2026 en el destino:
+
+- Resource Group inicialmente vacío, con estado `Succeeded`; posteriormente el usuario creó allí `keyvaultsecretsvpn`. La identidad actual tiene acciones de administración `*` sin `notActions` en ese ámbito. Esto no demuestra permisos sobre secretos de Key Vault.
+- Una VNet existente: `vnet-brujula-central-3936`, RG `ROGERPRIVATEGBB`, con `10.42.0.0/16` y sin peerings. No hay VPN gateways, LNG, hubs ni sitios Virtual WAN. El comprobador de inventario del script no detectó solapamientos con los prefijos de ejemplo.
+- Bicep compila. `Microsoft.Network` está registrado y anuncia VPN gateways, VNets e IP públicas en México Central. Las cuotas consultadas de VNets, NSG e IPv4 públicas Standard tienen margen; esto no garantiza capacidad para `VpnGw1AZ`.
+- El usuario confirmó que `azure.jaropro.net` es un registro público recién creado y correcto; queda pendiente su propagación o expiración de caché local. El equipo tiene configurados `192.168.50.127` y `192.168.50.1` como servidores DNS IPv4. La consulta explícita a `192.168.50.127` devolvió nombre inexistente; `192.168.50.1`, `1.1.1.1` y `8.8.8.8` devolvieron `189.236.75.52`. La respuesta local distinta no se considera evidencia de un DDNS incorrecto ni motivo para cambiar su configuración. Repetir CheckDns antes de las pruebas desde este equipo; la coincidencia con la WAN no se verificó directamente desde el router. No fijar esta IP en la plantilla. No se modificó DNS.
+- El Key Vault previo `kvbrujulacentral3936` en `ROGERPRIVATEGBB` no se seleccionó ni modificó. El usuario creó `keyvaultsecretsvpn` en `APPSEROGERVPN`, región `brazilsouth`, con RBAC, `enabledForTemplateDeployment=true` y acceso público deshabilitado. El vault puede referenciarse desde la VPN en `mexicocentral`; no se cambia su región ni su acceso de red. La identidad CLI no tiene permiso de lectura de metadatos de secretos (`ForbiddenByRbac`); no se leyeron valores de secretos ni se concedieron permisos.
+- `main.parameters.json` local, ignorado por Git, usa `roger-vpn`, `Environment=self-learning`, `Owner=rooliva`, `CostCenter=SE ROGEROA`, las redes confirmadas y `keyVaultName=keyvaultsecretsvpn`. Este nombre sustituye la propuesta anterior `kv-roger-vpn-10e50296`.
+- El preflight del script pasó. El what-if devolvió `Succeeded`: 13 creaciones de recursos de red, ningún borrado ni modificación y el Key Vault como `Ignore`. Se corrigió el formato de salida del script usando `--no-pretty-print` para procesar JSON.
+- **Despliegue bloqueado por el secreto:** la validación ARM con nivel `Provider` devolvió `KeyVaultParameterReferenceSecretRetrieveFailed` / `NotFound` para `vpn-office-01-psk`. El what-if satisfactorio no demuestra que el secreto exista. Crear el secreto con ese nombre en `keyvaultsecretsvpn`, usando la misma PSK que se configurará en OPNsense, o corregir el nombre en los parámetros si ya existe con otro nombre. No guardar el valor en el repositorio ni compartirlo en el chat. Repetir validación ARM, preflight y what-if antes de desplegar. No se desplegaron recursos.
+
 Las redes de módem Infinitum `192.168.4.0/24`, módem Totalplay `192.168.44.0/24` y tránsito ER605 `192.168.5.0/29` son exclusiones, no destinos LAN del túnel. El script rechaza anunciarlas (también prefijos agregados que las incluyan). La reserva Azure fuera de `192.168.0.0/16` evita utilizarlas en Hub/Spokes. No se cambia DHCP ni direccionamiento real.
 
 ## 6. Validación
@@ -235,7 +250,7 @@ Copy-Item .\main.parameters.example.json .\main.parameters.json
 Completar los valores y validar:
 
 ```powershell
-.\scripts\vpn.ps1 -Mode Validate -SubscriptionId '662141d0-0308-4187-b46b-db1e9466b5ac' -ResourceGroupName 'NOMBRE-RG' -ParameterFile .\main.parameters.json
+.\scripts\vpn.ps1 -Mode Validate -SubscriptionId '55318ed6-5d8a-4bd2-889f-10e502960c28' -ResourceGroupName 'APPSEROGERVPN' -ParameterFile .\main.parameters.json
 ```
 
 La validación compila Bicep, comprueba placeholders, CIDR IPv4, solapamientos internos, subredes dentro de VNets, FQDN, campos BGP cuando aplica, estado de Azure, existencia del RG/Key Vault y ownership. `SubscriptionId` es obligatorio para operaciones Azure: cada comando lo pasa explícitamente, sin cambiar tenant ni suscripción predeterminada. No cambia recursos ni lee el valor del PSK.
@@ -254,22 +269,28 @@ Para validar localmente sin consultar Azure:
 
 Para oficinas, `addressPrefixes` debe contener al menos un prefijo. El FQDN debe ser un nombre DNS válido. Cada oficina requiere `pskSecretName`. Al habilitar BGP, cada oficina necesita `asn` y `bgpPeerIp`.
 
-Al habilitar BGP, definir además `azureBgpAsn`. Azure asigna la dirección de peer del gateway; consultarla después del despliegue con `az network vnet-gateway list-bgp-peer-status --subscription 662141d0-0308-4187-b46b-db1e9466b5ac --resource-group NOMBRE-RG --name PREFIJO-vpn-gateway`.
+Al habilitar BGP, definir además `azureBgpAsn`. Azure asigna la dirección de peer del gateway; consultarla después del despliegue con `az network vnet-gateway list-bgp-peer-status --subscription 55318ed6-5d8a-4bd2-889f-10e502960c28 --resource-group APPSEROGERVPN --name PREFIJO-vpn-gateway`.
 
 ## 7. What-if
 
 ```powershell
-.\scripts\vpn.ps1 -Mode WhatIf -SubscriptionId '662141d0-0308-4187-b46b-db1e9466b5ac' -ResourceGroupName 'NOMBRE-RG' -ParameterFile .\main.parameters.json
+.\scripts\vpn.ps1 -Mode WhatIf -SubscriptionId '55318ed6-5d8a-4bd2-889f-10e502960c28' -ResourceGroupName 'APPSEROGERVPN' -ParameterFile .\main.parameters.json
 ```
 
 Revisar el resultado completo antes del despliegue. El script detiene la operación si el what-if incluye un borrado o un tipo de cambio no reconocido. El modo incremental no elimina recursos que se quiten posteriormente de los arrays; retirarlos requiere un procedimiento explícito y revisión manual. No aprobar cambios fuera del prefijo/tags de esta solución.
 
 El what-if es una estimación del plano de control: confirmar en el resultado nombres, regiones, CIDR, peerings, reglas y recursos opcionales. No sustituye la aprobación del cambio ni la prueba de compatibilidad IPsec/OPNsense.
 
+El script usa `--no-pretty-print --output json`: Azure CLI puede devolver una vista para humanos en what-if aunque se indique solamente `--output json`. Un what-if satisfactorio tampoco garantiza la recuperación del secreto; ejecutar además validación ARM antes de desplegar:
+
+```powershell
+az deployment group validate --subscription 55318ed6-5d8a-4bd2-889f-10e502960c28 --resource-group APPSEROGERVPN --name hybrid-vpn-validation --template-file .\main.bicep --parameters '@main.parameters.json' --validation-level Provider
+```
+
 ## 8. Despliegue
 
 ```powershell
-.\scripts\vpn.ps1 -Mode Deploy -SubscriptionId '662141d0-0308-4187-b46b-db1e9466b5ac' -ResourceGroupName 'NOMBRE-RG' -ParameterFile .\main.parameters.json -DeploymentName 'hybrid-vpn'
+.\scripts\vpn.ps1 -Mode Deploy -SubscriptionId '55318ed6-5d8a-4bd2-889f-10e502960c28' -ResourceGroupName 'APPSEROGERVPN' -ParameterFile .\main.parameters.json -DeploymentName 'hybrid-vpn'
 ```
 
 El script vuelve a validar, muestra el what-if, exige escribir `DEPLOY` y ejecuta `az deployment group create --mode Incremental`. No hay operación de crear o borrar Resource Group ni un modo Complete.

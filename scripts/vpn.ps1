@@ -615,6 +615,7 @@ function Invoke-WhatIf {
         '--template-file', $templateFile,
         '--parameters', "@$parameterPath",
         '--mode', 'Incremental',
+        '--no-pretty-print',
         '--output', 'json'
     )
     $json = Invoke-Az $arguments

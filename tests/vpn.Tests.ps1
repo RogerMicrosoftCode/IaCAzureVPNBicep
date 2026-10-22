@@ -15,6 +15,7 @@ foreach ($definition in $ast.FindAll({
 $realInvokeAz = (Get-Command Invoke-Az).ScriptBlock
 $SubscriptionId = '662141d0-0308-4187-b46b-db1e9466b5ac'
 $ResourceGroupName = 'test-rg'
+$DeploymentName = 'test-vpn'
 $baseId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Network"
 $parameterPath = Join-Path ([System.IO.Path]::GetTempPath()) ("vpn-tests-{0}.json" -f [guid]::NewGuid())
 $passed = 0
@@ -48,6 +49,7 @@ function Reset-Fixture {
     $script:calls = [System.Collections.Generic.List[object]]::new()
     $script:LocalOnly = $false
     $script:Mode = 'Validate'
+    $script:whatIfResponse = '{"changes":[{"changeType":"Create","resourceId":"/test/resource"}]}'
 }
 
 function New-Vnet {
@@ -72,6 +74,10 @@ function Invoke-Az {
         'group' { return 'true' }
         'resource' { return '[]' }
         'keyvault' { return '/test/keyvault' }
+        'deployment' {
+            if ('--no-pretty-print' -notin $Arguments) { return 'Note: human-readable what-if output' }
+            return $whatIfResponse
+        }
         'rest' {
             $url = $Arguments[[array]::IndexOf($Arguments, '--url') + 1]
             if ($responses.ContainsKey($url)) { return $responses[$url] }
@@ -219,6 +225,15 @@ try {
         $dispatchPattern = [regex]::Escape("'$modeName' {") + '\s+\$(?:validation|null) = Assert-Configuration'
         Assert-True ($scriptText -match $dispatchPattern) "$modeName dispatch starts with shared preflight"
     }
+
+    Reset-Fixture
+    $whatIfResult = Invoke-WhatIf | ConvertFrom-Json
+    Assert-True ($whatIfResult.changes[0].changeType -eq 'Create') 'WhatIf parses structured CLI output'
+    Assert-True ('--no-pretty-print' -in $calls[0]) 'WhatIf disables human-readable formatting'
+    $whatIfResponse = '{"changes":[{"changeType":"Delete","resourceId":"/test/resource"}]}'
+    Assert-Throws { Invoke-WhatIf } 'contains a deletion' 'WhatIf still blocks deletions'
+    $whatIfResponse = '{}'
+    Assert-Throws { Invoke-WhatIf } 'did not contain a changes list' 'WhatIf still rejects missing changes'
 
     # Exercise the real command wrapper with a fake CLI; no process or Azure calls.
     function az {
