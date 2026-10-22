@@ -32,7 +32,7 @@
       "value": "VpnGw1AZ"
     },
     "vpnGatewayGeneration": {
-      "value": "Generation2"
+      "value": "Generation1"
     },
     "enableBgp": {
       "value": false
@@ -44,9 +44,9 @@
       "value": [
         {
           "name": "office-01",
-          "fqdn": "vpn-office-01.example.invalid",
+          "fqdn": "azure.jaropro.net",
           "addressPrefixes": [
-            "192.168.10.0/24"
+            "192.168.50.0/24"
           ],
           "pskSecretName": "CHANGE-ME-office-01-psk",
           "asn": 65010,

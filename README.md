@@ -6,7 +6,7 @@ Esta solución despliega una VNet Hub con Azure VPN Gateway, una o más conexion
 
 El despliegue es Bicep a nivel de Resource Group y usa modo incremental. El Resource Group debe existir; los scripts no lo crean ni lo eliminan. Los recursos de la solución llevan el tag `Solution=hybrid-vpn-bicep`. El script detiene la operación si detecta una colisión de nombres sin ese tag.
 
-> **Estado:** plantilla de referencia. Los CIDR, región, nombres y endpoints del archivo de ejemplo son ilustrativos; deben reemplazarse y validarse antes de cualquier despliegue.
+> **Estado:** plantilla de referencia adaptada a jaropro. La LAN confirmada es `192.168.50.0/24` y el FQDN elegido es `azure.jaropro.net`. Persisten placeholders de nombres, etiquetas y Key Vault; no está lista para desplegar. No se ha modificado Azure, DNS ni la LAN.
 
 ## Índice
 
@@ -32,11 +32,11 @@ El Hub concentra el VPN Gateway y sus conexiones. Cada oficina tiene su propio L
 ```mermaid
 flowchart LR
     subgraph OnPrem["Oficinas / sitios"]
-        O1["OPNsense oficina 01<br/>WAN dinámica · DDNS FQDN<br/>LAN: prefijos on-premises"]
+        O1["OPNsense jaropro<br/>WAN 192.168.5.3/29 → ER605 → módem<br/>LAN: 192.168.50.0/24"]
         O2["OPNsense oficina N<br/>WAN dinámica · DDNS FQDN<br/>LAN: prefijos on-premises"]
     end
 
-    DNS["Proveedor DDNS<br/>FQDN → IP WAN actual"]
+    DNS["DNS público / actualización DDNS pendiente<br/>azure.jaropro.net → IPv4 pública ISP activo"]
     Internet(("Internet"))
 
     subgraph Azure["Azure · Resource Group existente"]
@@ -76,17 +76,20 @@ flowchart LR
 
 ### Vista lógica de conectividad y red
 
-Ejemplo con los CIDR ficticios del archivo de parámetros. Sustituirlos por rangos reales sin solapamiento antes de desplegar. La ruta entre oficinas y Spokes atraviesa el VPN Gateway y el peering; el NSG de cada subnet Spoke es el control de entrada declarado por la plantilla.
+La LAN coincide con el mapa jaropro.net v6.6 aportado por el usuario; los CIDR Azure propuestos se conservan porque no se solapan con el inventario revisado. Volver a comprobarlos antes de desplegar. La ruta entre oficina y Spokes atraviesa el VPN Gateway y el peering; el NSG de cada subnet Spoke es el control de entrada declarado por la plantilla.
 
 ```mermaid
 flowchart LR
-    subgraph Office["Oficina (ejemplo)"]
-        LAN["LAN on-premises<br/>192.168.10.0/24"]
-        FW["OPNsense<br/>WAN pública dinámica"]
+    subgraph Office["Oficina jaropro"]
+        LAN["LAN on-premises<br/>192.168.50.0/24"]
+        FW["OPNsense<br/>LAN .50.254 · WAN .5.3/29"]
+        ER["ER605 · 192.168.5.1<br/>Failover Infinitum / Totalplay"]
+        ISP["Módem ISP activo<br/>NAT y CGNAT por verificar"]
         LAN --> FW
+        FW --> ER --> ISP
     end
 
-    FQDN["FQDN DDNS<br/>resuelve la IP WAN actual"]
+    FQDN["azure.jaropro.net<br/>IPv4 pública del ISP activo"]
     WAN(("Internet"))
 
     subgraph Hub["Hub VNet · 10.100.0.0/24"]
@@ -109,7 +112,7 @@ flowchart LR
     end
 
     FW -. "DDNS: solo nombre, no IP fija" .-> FQDN
-    FW ==>|"IKEv2 / IPsec · UDP 500/4500"| WAN
+    ISP ==>|"IKEv2 / IPsec · NAT-T UDP 500/4500"| WAN
     WAN ==>|túnel| GW
     GW -->|"Peering Hub→Spoke: allowGatewayTransit"| NSG1
     NSG1 -->|"Peering Spoke→Hub: useRemoteGateways"| GW
@@ -145,9 +148,10 @@ flowchart LR
 
 ### Red y tránsito
 
-- Las VNets Azure deben usar prefijos RFC1918 que no se superpongan con `192.168.0.0/16`. Las oficinas sí pueden usar, por ejemplo, `192.168.10.0/24`.
+- Las VNets Azure deben usar prefijos RFC1918 que no se superpongan con `192.168.0.0/16`. La oficina jaropro anuncia únicamente `192.168.50.0/24`.
 - El VPN Gateway vive solo en `GatewaySubnet`. No se asocia un NSG ni una route table a `GatewaySubnet`.
 - Solo el peering Hub→Spoke establece `allowGatewayTransit: true`; solo el peering Spoke→Hub establece `useRemoteGateways: true`.
+- El peering Spoke→Hub espera explícitamente al gateway y al peering Hub→Spoke. El ejemplo usa `VpnGw1AZ` con `Generation1`: [la tabla oficial de SKU](https://learn.microsoft.com/azure/vpn-gateway/about-gateway-skus) no admite `Generation2` para ese SKU. Ver también [tránsito de gateway](https://learn.microsoft.com/azure/vpn-gateway/vpn-gateway-peering-gateway-transit).
 - El tráfico entre dos Spokes no se enruta automáticamente.
 - Las reglas de entrada de NSG se crean solo en NSG asociados a subredes Spoke. Las reglas declaradas en `authorizedInboundRules` son TCP y se aplican desde todos los prefijos de oficinas a todos los destinos de las subredes Spoke.
 - Cada regla de puerto tiene esta forma: `{"name":"https","destinationPort":443}`. Si no se define ninguna, no hay reglas de entrada personalizadas.
@@ -181,6 +185,8 @@ flowchart LR
 │   └── vpn-connection.bicep
 ├── scripts/
 │   └── vpn.ps1
+├── tests/
+│   └── vpn.Tests.ps1
 ├── .gitignore
 └── README.md
 ```
@@ -189,7 +195,7 @@ flowchart LR
 
 - `main.bicep`: Hub, Spokes, subredes, NSG, peerings, VPN Gateway, LNG, conexiones, DNS privado y recursos opcionales.
 - `modules/vpn-connection.bicep`: recurso de conexión IPsec con parámetro seguro para el PSK recuperado desde Key Vault.
-- `main.parameters.example.json`: plantilla de configuración con valores ficticios y placeholders.
+- `main.parameters.example.json`: LAN y FQDN elegidos, rangos Azure propuestos y placeholders para los datos pendientes.
 - `scripts/vpn.ps1`: validación, what-if, despliegue, comprobación DDNS, estado de conexiones y pruebas TCP.
 - `docs/*.excalidraw`: fuentes editables de los diagramas de infraestructura y red. Los diagramas Mermaid anteriores son las vistas rápidas para GitHub.
 - `.gitignore`: excluye los parámetros locales y los artefactos de compilación.
@@ -208,9 +214,15 @@ Copiar el ejemplo a `main.parameters.json` y reemplazar los datos pendientes. El
 | Network Management | `10.100.0.224/27` | Administración de red |
 | Spoke `apps-01` | `10.101.0.0/24` | Aplicaciones |
 | Spoke `apps-02` | `10.102.0.0/24` | Aplicaciones |
-| Oficina `office-01` | `192.168.10.0/24` | Prefijo on-premises de muestra |
+| Oficina `office-01` | `192.168.50.0/24` | LAN real jaropro; único prefijo anunciado |
 
 Los rangos de Bastion y Firewall solo se incorporan a la VNet Hub cuando se habilita el servicio correspondiente. La asignación de ejemplo está dentro del Hub y evita solapamientos.
+
+### Inventario revisado y redes excluidas
+
+Consulta de solo lectura del 22/10/2026 en la suscripción `662141d0-0308-4187-b46b-db1e9466b5ac` (`MCAPS-Hybrid-REQ-116668-2025-rooliva`, tenant `16b3c013-d300-468d-ac64-7eda0820b6d3`): `vnet-superag-eastus` en RG `superag` usa `10.0.0.0/16`; `vnet-finopsazure` en RG `finopsazure` usa `10.30.0.0/16`. Ambas sin peerings. No se encontraron gateways VPN, LNG, hubs o sitios Virtual WAN. No hay solapamiento con los tres `/24` propuestos ni con la LAN de oficina; **no se renumeran ni se conectan esas VNets existentes**.
+
+Las redes de módem Infinitum `192.168.4.0/24`, módem Totalplay `192.168.44.0/24` y tránsito ER605 `192.168.5.0/29` son exclusiones, no destinos LAN del túnel. El script rechaza anunciarlas (también prefijos agregados que las incluyan). La reserva Azure fuera de `192.168.0.0/16` evita utilizarlas en Hub/Spokes. No se cambia DHCP ni direccionamiento real.
 
 ## 6. Validación
 
@@ -223,12 +235,16 @@ Copy-Item .\main.parameters.example.json .\main.parameters.json
 Completar los valores y validar:
 
 ```powershell
-.\scripts\vpn.ps1 -Mode Validate -ResourceGroupName 'NOMBRE-RG' -ParameterFile .\main.parameters.json
+.\scripts\vpn.ps1 -Mode Validate -SubscriptionId '662141d0-0308-4187-b46b-db1e9466b5ac' -ResourceGroupName 'NOMBRE-RG' -ParameterFile .\main.parameters.json
 ```
 
-La validación compila Bicep, comprueba placeholders, CIDR IPv4, solapamientos Azure/on-premises, subredes dentro de VNets, FQDN, campos BGP cuando aplica, estado de Azure, existencia del RG/Key Vault y ownership de recursos con el prefijo elegido. No cambia recursos ni lee el valor del PSK.
+La validación compila Bicep, comprueba placeholders, CIDR IPv4, solapamientos internos, subredes dentro de VNets, FQDN, campos BGP cuando aplica, estado de Azure, existencia del RG/Key Vault y ownership. `SubscriptionId` es obligatorio para operaciones Azure: cada comando lo pasa explícitamente, sin cambiar tenant ni suscripción predeterminada. No cambia recursos ni lee el valor del PSK.
 
-`-LocalOnly` valida estructura, CIDR, nombres, placeholders y compila Bicep, pero **no** comprueba login, suscripción, existencia del Resource Group ni permisos/secretos de Key Vault.
+`Validate`, `WhatIf` y `Deploy` ejecutan el mismo preflight de solo lectura: compara intervalos IPv4 (incluidos solapamientos parciales y contención) contra todas las VNets, prefijos de LNG y pools P2S de gateways de esa suscripción. Recorre peerings y consulta las VNets remotas por ID, incluidas otras suscripciones; fallos de consulta, permisos o respuestas incompletas detienen la operación. Solo exime la coincidencia con el **ID exacto previsto y tag de ownership**, conservando los prefijos existentes. Bloquea cambios del espacio de VNets/LNG propios y renumeración o retirada de sus subredes; un tag o prefijo de nombre por sí solo nunca exime una red ajena. Si el gateway previsto ya tiene P2S, se detiene para no retirar una configuración que esta plantilla no administra.
+
+Si encuentra hubs o sitios Virtual WAN, se detiene para revisión específica de sus pools/rutas. No inventaría redes desconectadas de otras suscripciones, pools P2S de gateways de suscripciones remotas, rutas aprendidas BGP, UDR, traducciones NAT ni redes locales no declaradas. No demuestra disponibilidad de SKU/cuota regional ni reserva direcciones; repetir antes de desplegar y revisar el what-if. Un LNG ajeno que repita la LAN también provoca bloqueo conservador, aunque represente el mismo sitio: requiere revisión, no una excepción automática.
+
+`-LocalOnly` solo se admite con `Validate`: valida estructura, CIDR, nombres, placeholders y compila Bicep, pero **no verifica disponibilidad de redes Azure**, login, suscripción, existencia del Resource Group ni permisos/secretos de Key Vault. Emite una advertencia explícita; no puede usarse para omitir el inventario en WhatIf/Deploy.
 
 Para validar localmente sin consultar Azure:
 
@@ -238,12 +254,12 @@ Para validar localmente sin consultar Azure:
 
 Para oficinas, `addressPrefixes` debe contener al menos un prefijo. El FQDN debe ser un nombre DNS válido. Cada oficina requiere `pskSecretName`. Al habilitar BGP, cada oficina necesita `asn` y `bgpPeerIp`.
 
-Al habilitar BGP, definir además `azureBgpAsn`. Azure asigna la dirección de peer del gateway; consultarla después del despliegue con `az network vnet-gateway list-bgp-peer-status --resource-group NOMBRE-RG --name PREFIJO-vpn-gateway`.
+Al habilitar BGP, definir además `azureBgpAsn`. Azure asigna la dirección de peer del gateway; consultarla después del despliegue con `az network vnet-gateway list-bgp-peer-status --subscription 662141d0-0308-4187-b46b-db1e9466b5ac --resource-group NOMBRE-RG --name PREFIJO-vpn-gateway`.
 
 ## 7. What-if
 
 ```powershell
-.\scripts\vpn.ps1 -Mode WhatIf -ResourceGroupName 'NOMBRE-RG' -ParameterFile .\main.parameters.json
+.\scripts\vpn.ps1 -Mode WhatIf -SubscriptionId '662141d0-0308-4187-b46b-db1e9466b5ac' -ResourceGroupName 'NOMBRE-RG' -ParameterFile .\main.parameters.json
 ```
 
 Revisar el resultado completo antes del despliegue. El script detiene la operación si el what-if incluye un borrado o un tipo de cambio no reconocido. El modo incremental no elimina recursos que se quiten posteriormente de los arrays; retirarlos requiere un procedimiento explícito y revisión manual. No aprobar cambios fuera del prefijo/tags de esta solución.
@@ -253,7 +269,7 @@ El what-if es una estimación del plano de control: confirmar en el resultado no
 ## 8. Despliegue
 
 ```powershell
-.\scripts\vpn.ps1 -Mode Deploy -ResourceGroupName 'NOMBRE-RG' -ParameterFile .\main.parameters.json -DeploymentName 'hybrid-vpn'
+.\scripts\vpn.ps1 -Mode Deploy -SubscriptionId '662141d0-0308-4187-b46b-db1e9466b5ac' -ResourceGroupName 'NOMBRE-RG' -ParameterFile .\main.parameters.json -DeploymentName 'hybrid-vpn'
 ```
 
 El script vuelve a validar, muestra el what-if, exige escribir `DEPLOY` y ejecuta `az deployment group create --mode Incremental`. No hay operación de crear o borrar Resource Group ni un modo Complete.
@@ -276,7 +292,7 @@ En OPNsense, instalar/configurar `os-ddclient` o el backend recomendado por el p
 
 1. Crear un hostname DDNS por oficina.
 2. Usar el token API de mínimo privilegio; limitarlo a actualizar el registro necesario.
-3. Configurar detección IPv4 por WAN y actualización segura/SSL cuando el proveedor lo soporte.
+3. Detectar la IPv4 **pública de salida del ISP activo**, no la WAN privada `192.168.5.3` de OPNsense; usar actualización segura/SSL cuando el proveedor lo soporte.
 4. Mantener el token solo en la configuración protegida de OPNsense/proveedor. No incluirlo en Git, parámetros, capturas, tickets o logs.
 5. Comprobar el FQDN desde una red externa:
 
@@ -286,17 +302,27 @@ En OPNsense, instalar/configurar `os-ddclient` o el backend recomendado por el p
 
 El modo CheckDns muestra la respuesta A actual para diagnóstico, pero no escribe esa dirección en archivos ni la usa como configuración de Azure.
 
+### FQDN elegido: azure.jaropro.net
+
+El usuario controla `jaropro.net` y eligió `azure.jaropro.net` para identificar la salida de la oficina. El coordinador comprobó el 22/10/2026 mediante `Resolve-DnsName -Type A -DnsOnly` contra `1.1.1.1` y `8.8.8.8`: ambos respondieron `A 189.236.75.52`, TTL `3600`. Es evidencia puntual de resolución pública consistente, **no** confirmación de que coincida con la salida actual, de ausencia de proxy/CGNAT, de DDNS automático ni de accesibilidad IPsec. La IP observada no se fija en parámetros ni en el LNG.
+
+Verificar que sea un registro A público **DNS-only, sin proxy/CDN**, apuntando a la IPv4 pública de la oficina, no a la IP pública del gateway Azure. Verificar actualización al cambiar la IP o al conmutar Infinitum/Totalplay. El TTL observado permite caché de hasta una hora; se recomienda 60–300 segundos si el proveedor lo admite, sin afirmar que se haya cambiado. `opnsense.jaropro.net` es el hostname aportado del firewall, no el DDNS seleccionado.
+
 ### CGNAT y Double NAT
 
-Una IP dinámica pública suele funcionar. CGNAT puede impedir que Azure alcance el firewall: comparar la IPv4 WAN de OPNsense con la dirección observada desde Internet. `100.64.0.0/10` es un rango habitual de CGNAT; también investigar si la WAN pertenece a `10.0.0.0/8`, `172.16.0.0/12` o `192.168.0.0/16`.
+En jaropro el camino es OPNsense (`192.168.5.3/29`) → ER605 (`192.168.5.1`) → módem del ISP activo. Las WAN del ER605 son `192.168.4.240` vía Infinitum `192.168.4.254`, o `192.168.44.241` vía Totalplay `192.168.44.254`. Hay NAT potencialmente múltiple: la WAN privada de OPNsense por sí sola no demuestra CGNAT. Para cada ISP, comparar la WAN del módem con la IPv4 observada desde Internet; investigar `100.64.0.0/10` y rangos privados.
 
 Double NAT ocurre cuando el módem/router del ISP y OPNsense traducen tráfico. Revisar bridge mode/IP passthrough, reglas de reenvío necesarias, NAT-T y que UDP 500/4500 lleguen al firewall. Si existe CGNAT del proveedor, un port forward local no lo resuelve: solicitar salida de CGNAT o una IPv4 pública.
+
+Verificar IPsec passthrough/NAT-T en ER605 y módem, salida y retorno UDP 500/4500 y, cuando sea necesario, reenvíos encadenados hasta OPNsense sin conflicto con otros terminadores IPsec. No abrir administración del firewall/router a Internet. No se cambiaron esos dispositivos.
 
 ### TTL y cambio de IP
 
 Configurar un TTL bajo que el proveedor DDNS realmente soporte, por ejemplo 60–300 segundos, y considerar sus límites/cachés. El TTL no elimina cachés recursivas ni acelera la actualización del proveedor. Tras un cambio de IP pueden persistir la IP anterior en cachés DNS; durante la convergencia, IKE/IPsec puede desconectarse temporalmente. DPD y rekey ayudan a recuperar, pero la reconexión no es instantánea.
 
 El FQDN se configura en el Local Network Gateway; no usar la salida de `CheckDns` para reemplazarlo por una IP en Bicep o en el archivo de parámetros.
+
+El failover del ER605 no equivale a failover VPN instantáneo: actualización DNS, caché, NAT, DPD y renegociación IKE/CHILD SA determinan la reconvergencia. Si falla OPNsense, pasar a Internet por el ROG no conserva este túnel; el ROG tiene WAN independiente (`192.168.5.2/29`) y no es el terminador VPN de esta solución.
 
 ## 10. Configuración IPsec
 
@@ -314,10 +340,14 @@ Configurar OPNsense con los valores que coincidan con `modules/vpn-connection.bi
 | Mode | Tunnel |
 | PSK | El secreto independiente de esa oficina |
 | Remote endpoint | IP pública de Azure VPN Gateway |
-| Local networks | Prefijos LAN de la oficina |
+| Local networks | Solo `192.168.50.0/24` en jaropro |
 | Remote networks | Hub y prefijos de todos los Spokes |
 
 Habilitar DPD, revisar NAT-T y confirmar que UDP 500 y UDP 4500 estén permitidos donde corresponda. Las pantallas/campos dependen de la versión de OPNsense. No usar reglas `Any → Any` permanentes; permitir únicamente los flujos requeridos. Excluir el tráfico privado Azure del Outbound NAT de OPNsense para conservar las IP LAN.
+
+Aplicar esa exclusión solo a destinos `10.100.0.0/24`, `10.101.0.0/24` y `10.102.0.0/24`; conservar el NAT y la ruta por defecto de Internet. Alinear rutas/selectores IPsec para esos destinos, sin anunciar las redes ISP/tránsito ni introducir `0.0.0.0/0` por el túnel. Elegir y comprobar un modo IPsec coherente con las políticas y rutas de la versión OPNsense instalada antes de producción.
+
+La LAN anuncia actualmente gateway `192.168.50.254` por DHCP del ROG; esto **no garantiza** conmutación automática al ROG `192.168.50.1`. Los DNS primario/secundario tampoco garantizan uso secuencial. No se rediseña LAN/DHCP. Pi-hole `192.168.50.127` puede necesitar forwarding condicional hacia un resolvedor alcanzable en Azure si se requieren zonas privadas; vincular Private DNS a una VNet no basta para resolverlas desde la oficina. No se añade ningún servicio de resolución pagado.
 
 La política exacta del gateway y de OPNsense debe comprobarse con la versión/SKU desplegados antes de producción; una modificación de IP, PSK, selectores o política puede reiniciar el túnel.
 
@@ -326,7 +356,7 @@ La política exacta del gateway y de OPNsense debe comprobarse con la versión/S
 Revisar el estado del túnel:
 
 ```powershell
-.\scripts\vpn.ps1 -Mode Status -ResourceGroupName 'NOMBRE-RG' -ParameterFile .\main.parameters.json
+.\scripts\vpn.ps1 -Mode Status -SubscriptionId '662141d0-0308-4187-b46b-db1e9466b5ac' -ResourceGroupName 'NOMBRE-RG' -ParameterFile .\main.parameters.json
 ```
 
 Probar destinos TCP definidos por el operador:
@@ -345,6 +375,12 @@ Lista de comprobación posterior al despliegue:
 - Confirmar estado de ambos peerings por Spoke y las flags de tránsito en el lado correcto.
 - Probar por separado TCP a cada host/puerto aprobado; una conexión establecida no demuestra por sí sola que todas las rutas y aplicaciones funcionen.
 - Confirmar que no se ha asociado accidentalmente un NSG ni una route table a `GatewaySubnet`.
+
+Pruebas de regresión locales del script, con inventario simulado y sin acceso Azure ni dispositivos:
+
+```powershell
+pwsh -NoProfile -File .\tests\vpn.Tests.ps1
+```
 
 ## 12. Operación
 
@@ -373,8 +409,8 @@ Lista de comprobación posterior al despliegue:
 
 Antes de producción, completar y verificar esta lista por cada oficina y entorno:
 
-- FQDN DDNS real por oficina.
-- Prefijos reales por oficina.
+- Confirmar actualización automática y coincidencia del FQDN elegido `azure.jaropro.net` con la salida pública activa.
+- LAN jaropro confirmada: `192.168.50.0/24`; verificar que solo esta se anuncie.
 - Proveedor DDNS.
 - API token DDNS (guardar en OPNsense/proveedor; no mostrarlo ni incluirlo en archivos).
 - PSK independiente por oficina (solo Key Vault y OPNsense; no mostrarla).

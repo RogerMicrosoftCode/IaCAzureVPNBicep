@@ -19,6 +19,12 @@ $parameterPath = [System.IO.Path]::GetFullPath($ParameterFile)
 function Invoke-Az {
     param([Parameter(Mandatory)][string[]]$Arguments)
 
+    if ($Arguments[0] -ne 'bicep' -and '--subscription' -notin $Arguments) {
+        if ([string]::IsNullOrWhiteSpace($SubscriptionId)) {
+            throw 'SubscriptionId is required for Azure operations; no default subscription is used.'
+        }
+        $Arguments += @('--subscription', $SubscriptionId)
+    }
     $output = & az @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw "Azure CLI command failed (exit code $LASTEXITCODE): az $($Arguments -join ' ')"
@@ -116,6 +122,183 @@ function Test-RangeContains {
     return ($Outer.Start -le $Inner.Start) -and ($Outer.End -ge $Inner.End)
 }
 
+function Get-NetworkCollection {
+    param([Parameter(Mandatory)][string]$ResourceType)
+
+    $url = "https://management.azure.com/subscriptions/$SubscriptionId/providers/Microsoft.Network/${ResourceType}?api-version=2024-05-01"
+    do {
+        $json = Invoke-Az @('rest', '--method', 'get', '--url', $url, '--output', 'json')
+        $page = ($json -join "`n") | ConvertFrom-Json
+        if ($null -eq $page -or $null -eq $page.PSObject.Properties['value'] -or $page.value -isnot [array]) {
+            throw "Invalid network inventory response for '$ResourceType'; availability was not verified."
+        }
+        foreach ($resource in $page.value) {
+            if ([string]::IsNullOrWhiteSpace([string]$resource.id) -or $null -eq $resource.properties) {
+                throw "Incomplete network inventory entry for '$ResourceType'."
+            }
+            Write-Output $resource
+        }
+        $url = [string]$page.nextLink
+    } while (-not [string]::IsNullOrWhiteSpace($url))
+}
+
+function Assert-UnchangedPrefixes {
+    param(
+        [Parameter(Mandatory)][string]$ResourceId,
+        [AllowEmptyCollection()][string[]]$Existing,
+        [AllowEmptyCollection()][string[]]$Desired
+    )
+
+    $oldRanges = @($Existing | ForEach-Object {
+        $range = ConvertTo-IPv4Range $_
+        "$($range.Start)-$($range.End)"
+    } | Sort-Object -Unique)
+    $newRanges = @($Desired | ForEach-Object {
+        $range = ConvertTo-IPv4Range $_
+        "$($range.Start)-$($range.End)"
+    } | Sort-Object -Unique)
+    if ($oldRanges.Count -ne $newRanges.Count -or ($oldRanges -join ',') -ne ($newRanges -join ',')) {
+        throw "Addressing change blocked for '$ResourceId'. Existing: $($Existing -join ', '); requested: $($Desired -join ', '). No automatic renumbering is allowed."
+    }
+}
+
+function Assert-AzureAddressAvailability {
+    param(
+        [Parameter(Mandatory)]$Configuration,
+        [Parameter(Mandatory)][string]$ResourceGroup
+    )
+
+    $prefix = [string](Get-ParameterValue $Configuration 'resourcePrefix')
+    $baseId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.Network"
+    $hubSubnets = @(
+        @{ name = 'GatewaySubnet'; addressPrefix = Get-ParameterValue $Configuration 'gatewaySubnetPrefix' },
+        @{ name = 'SharedServicesSubnet'; addressPrefix = Get-ParameterValue $Configuration 'sharedServicesSubnetPrefix' },
+        @{ name = 'NetworkManagementSubnet'; addressPrefix = Get-ParameterValue $Configuration 'networkManagementSubnetPrefix' }
+    )
+    if ((Get-ParameterValue $Configuration 'enableFirewall') -eq $true) {
+        $hubSubnets += @{ name = 'AzureFirewallSubnet'; addressPrefix = Get-ParameterValue $Configuration 'firewallSubnetPrefix' }
+    }
+    if ((Get-ParameterValue $Configuration 'enableBastion') -eq $true) {
+        $hubSubnets += @{ name = 'AzureBastionSubnet'; addressPrefix = Get-ParameterValue $Configuration 'bastionSubnetPrefix' }
+    }
+    $expected = @{}
+    $expected["$baseId/virtualNetworks/$prefix-hub-vnet"] = @{
+        Prefixes = @([string](Get-ParameterValue $Configuration 'hubAddressPrefix'))
+        Subnets = $hubSubnets
+    }
+    foreach ($spoke in (Get-ParameterValue $Configuration 'spokes')) {
+        $id = "$baseId/virtualNetworks/$prefix-$($spoke.name)-vnet"
+        if ($expected.ContainsKey($id)) {
+            throw "Duplicate planned VNet ID '$id'; choose a different Spoke name."
+        }
+        $expected[$id] = @{ Prefixes = @($spoke.addressPrefix); Subnets = @($spoke.subnets) }
+    }
+    foreach ($office in (Get-ParameterValue $Configuration 'offices')) {
+        $expected["$baseId/localNetworkGateways/$prefix-$($office.name)-lng"] = @{
+            Prefixes = @($office.addressPrefixes)
+            Subnets = @()
+        }
+    }
+
+    $vnets = @(Get-NetworkCollection 'virtualNetworks')
+    $localGateways = @(Get-NetworkCollection 'localNetworkGateways')
+    $gateways = @(Get-NetworkCollection 'virtualNetworkGateways')
+    # Virtual WAN has separate site, hub and P2S routing models; do not claim availability there.
+    $hubs = @(Get-NetworkCollection 'virtualHubs')
+    $sites = @(Get-NetworkCollection 'vpnSites')
+    if ($hubs.Count -gt 0 -or $sites.Count -gt 0) {
+        throw 'Virtual WAN hubs or VPN sites exist. Review hub/site/P2S pools and routes separately; deployment stopped.'
+    }
+
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $allVnets = [System.Collections.Generic.List[object]]::new()
+    foreach ($vnet in $vnets) {
+        $null = $seen.Add([string]$vnet.id)
+        $allVnets.Add($vnet)
+    }
+    # Read live remote spaces, including cross-subscription peerings, rather than cached peering spaces.
+    for ($index = 0; $index -lt $allVnets.Count; $index++) {
+        foreach ($peering in $allVnets[$index].properties.virtualNetworkPeerings) {
+            $remoteId = [string]$peering.properties.remoteVirtualNetwork.id
+            if ($remoteId -notmatch '^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft.Network/virtualNetworks/[^/]+$') {
+                throw "Invalid remote VNet ID in peering '$($peering.id)'."
+            }
+            if ($seen.Add($remoteId)) {
+                $json = Invoke-Az @('rest', '--method', 'get', '--url', "https://management.azure.com${remoteId}?api-version=2024-05-01", '--output', 'json')
+                $remote = ($json -join "`n") | ConvertFrom-Json
+                if ($null -eq $remote -or $remote.id -ne $remoteId -or $null -eq $remote.properties.addressSpace.addressPrefixes) {
+                    throw "Incomplete remote VNet inventory for '$remoteId'."
+                }
+                $allVnets.Add($remote)
+            }
+        }
+    }
+
+    $inventory = [System.Collections.Generic.List[object]]::new()
+    foreach ($resource in @($allVnets.ToArray()) + $localGateways) {
+        $isVnet = $resource.id -match '/virtualNetworks/'
+        $cidrs = if ($isVnet) { @($resource.properties.addressSpace.addressPrefixes) }
+            elseif ($null -ne $resource.properties.localNetworkAddressSpace.addressPrefixes) {
+                @($resource.properties.localNetworkAddressSpace.addressPrefixes)
+            }
+            else { @() }
+        if ($isVnet -and ($cidrs.Count -eq 0 -or $null -eq $cidrs[0])) {
+            throw "Missing VNet address space for '$($resource.id)'."
+        }
+        if ($expected.ContainsKey([string]$resource.id)) {
+            if ($resource.tags.Solution -ne 'hybrid-vpn-bicep') {
+                throw "Resource collision: '$($resource.id)' is not solution-owned."
+            }
+            $planned = $expected[[string]$resource.id]
+            Assert-UnchangedPrefixes -ResourceId $resource.id -Existing $cidrs -Desired $planned.Prefixes
+            if ($isVnet) {
+                foreach ($subnet in $resource.properties.subnets) {
+                    $desiredSubnet = @($planned.Subnets | Where-Object { $_.name -eq $subnet.name })
+                    if ($desiredSubnet.Count -ne 1) {
+                        throw "Removal of existing subnet '$($subnet.id)' is blocked."
+                    }
+                    $existingPrefixes = @($subnet.properties.addressPrefixes)
+                    if ($subnet.properties.addressPrefix) { $existingPrefixes = @($subnet.properties.addressPrefix) }
+                    Assert-UnchangedPrefixes -ResourceId $subnet.id -Existing $existingPrefixes -Desired @($desiredSubnet[0].addressPrefix)
+                }
+            }
+        }
+        foreach ($cidr in $cidrs) {
+            if ([string]::IsNullOrWhiteSpace([string]$cidr)) {
+                throw "Empty address prefix in inventory for '$($resource.id)'."
+            }
+            if ($cidr -like '*:*') { continue }
+            $inventory.Add(@{ Id = [string]$resource.id; Range = ConvertTo-IPv4Range $cidr })
+        }
+    }
+    foreach ($gateway in $gateways) {
+        if ($gateway.id -eq "$baseId/virtualNetworkGateways/$prefix-vpn-gateway" -and
+            $null -ne $gateway.properties.vpnClientConfiguration) {
+            throw "Existing P2S configuration on '$($gateway.id)' is not managed by this template; deployment stopped to preserve its addressing."
+        }
+        $p2sPrefixes = $gateway.properties.vpnClientConfiguration.vpnClientAddressPool.addressPrefixes
+        if ($null -ne $gateway.properties.vpnClientConfiguration -and
+            ($null -eq $p2sPrefixes -or @($p2sPrefixes).Count -eq 0)) {
+            throw "Missing P2S address pool in inventory for '$($gateway.id)'."
+        }
+        foreach ($cidr in $p2sPrefixes) {
+            if ($cidr -like '*:*') { continue }
+            $inventory.Add(@{ Id = [string]$gateway.id; Range = ConvertTo-IPv4Range $cidr })
+        }
+    }
+    foreach ($id in $expected.Keys) {
+        foreach ($cidr in $expected[$id].Prefixes) {
+            $range = ConvertTo-IPv4Range $cidr
+            foreach ($existing in $inventory) {
+                if ($existing.Id -ne $id -and (Test-RangeOverlap $range $existing.Range)) {
+                    throw "Address conflict: '$cidr' ($id) overlaps '$($existing.Range.Cidr)' on '$($existing.Id)'."
+                }
+            }
+        }
+    }
+    Write-Host "IPv4 inventory checked in subscription $SubscriptionId : $($vnets.Count) VNets, $($localGateways.Count) local gateways, $($gateways.Count) gateways, plus remote peerings. No address reservation was made."
+}
+
 function Assert-OwnedResourceNames {
     param(
         [Parameter(Mandatory)][string]$ResourceGroup,
@@ -163,6 +346,12 @@ function Assert-Configuration {
     if (-not $LocalOnly -and [string]::IsNullOrWhiteSpace($ResourceGroupName)) {
         throw 'ResourceGroupName is required. This solution never creates or deletes a Resource Group.'
     }
+    if ($LocalOnly -and $Mode -ne 'Validate') {
+        throw 'LocalOnly is supported only with Validate; WhatIf and Deploy require a live inventory.'
+    }
+    if (-not $LocalOnly -and $SubscriptionId -notmatch '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') {
+        throw 'An explicit SubscriptionId GUID is required; the active/default subscription is never changed.'
+    }
 
     $rawParameters = Get-Content -LiteralPath $parameterPath -Raw
     $configuration = $rawParameters | ConvertFrom-Json
@@ -173,6 +362,13 @@ function Assert-Configuration {
     $tags = Get-ParameterValue $configuration 'tags'
     $offices = @(Get-ParameterValue $configuration 'offices')
     $spokes = @(Get-ParameterValue $configuration 'spokes')
+    $sku = [string](Get-ParameterValue $configuration 'vpnGatewaySku')
+    $generation = [string](Get-ParameterValue $configuration 'vpnGatewayGeneration')
+    if ([string]::IsNullOrWhiteSpace($sku)) { $sku = 'VpnGw1AZ' }
+    if ([string]::IsNullOrWhiteSpace($generation)) { $generation = 'Generation1' }
+    if ($sku -in @('VpnGw1', 'VpnGw1AZ') -and $generation -ne 'Generation1') {
+        throw "$sku requires Generation1. Generation2 is not supported for this SKU."
+    }
 
     if ([string]::IsNullOrWhiteSpace($prefix) -or $prefix -match '(?i)CHANGE-ME|REPLACE') {
         throw 'Replace the resourcePrefix placeholder before deploying.'
@@ -247,6 +443,11 @@ function Assert-Configuration {
         }
         foreach ($prefixValue in $office.addressPrefixes) {
             $officeRange = ConvertTo-IPv4Range ([string]$prefixValue)
+            foreach ($excludedPrefix in @('192.168.4.0/24', '192.168.44.0/24', '192.168.5.0/29')) {
+                if (Test-RangeOverlap $officeRange (ConvertTo-IPv4Range $excludedPrefix)) {
+                    throw "Office prefix '$prefixValue' overlaps excluded jaropro ISP/transit network '$excludedPrefix'; do not advertise it over S2S."
+                }
+            }
             foreach ($azureNetwork in $azureNetworks) {
                 if (Test-RangeOverlap $officeRange $azureNetwork) {
                     throw "On-premises prefix '$prefixValue' overlaps Azure prefix '$($azureNetwork.Cidr)'."
@@ -368,6 +569,7 @@ function Assert-Configuration {
     }
 
     if ($LocalOnly) {
+        Write-Warning 'LocalOnly: Azure address availability, remote peerings and P2S pools were NOT checked.'
         return [pscustomobject]@{
             Configuration = $configuration
             ResourcePrefix = $prefix
@@ -376,10 +578,11 @@ function Assert-Configuration {
     }
 
     $activeSubscription = [string](Invoke-Az @('account', 'show', '--query', 'id', '--output', 'tsv'))
-    if (-not [string]::IsNullOrWhiteSpace($SubscriptionId) -and $activeSubscription -ne $SubscriptionId) {
-        throw "The active Azure subscription '$activeSubscription' does not match requested subscription '$SubscriptionId'."
+    if ($activeSubscription.Trim() -ne $SubscriptionId) {
+        throw "Azure returned subscription '$activeSubscription' instead of requested '$SubscriptionId'."
     }
 
+    Assert-AzureAddressAvailability -Configuration $configuration -ResourceGroup $ResourceGroupName
     $groupExists = [string](Invoke-Az @('group', 'exists', '--name', $ResourceGroupName, '--output', 'tsv'))
     if ($groupExists.Trim() -ne 'true') {
         throw "Resource Group '$ResourceGroupName' does not exist. This solution will not create it."
