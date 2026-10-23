@@ -6,7 +6,7 @@ Esta solución despliega una VNet Hub con Azure VPN Gateway, Local Network Gatew
 
 El despliegue es Bicep a nivel de Resource Group y usa modo incremental. El Resource Group debe existir; los scripts no lo crean ni lo eliminan. Los recursos de la solución llevan el tag `Solution=hybrid-vpn-bicep`. El script detiene la operación si detecta una colisión de nombres sin ese tag.
 
-> **Estado:** infraestructura desplegada y verificada en `APPSEROGERVPN`, suscripción `55318ed6-5d8a-4bd2-889f-10e502960c28`, con `manageConnections=false`. Despliegue `hybrid-vpn-infra-20261022`: `Succeeded`. IP pública Azure: `158.23.21.92`. La LAN confirmada es `192.168.50.0/24` y el FQDN es `azure.jaropro.net`. La conexión IPsec y su PSK se configurarán manualmente después; este modo no necesita Key Vault y todavía no hay un túnel establecido. Los parámetros locales están ignorados por Git.
+> **Estado:** infraestructura desplegada y verificada en `APPSEROGERVPN`, suscripción `55318ed6-5d8a-4bd2-889f-10e502960c28`, con `manageConnections=false`. Despliegue `hybrid-vpn-infra-20261022`: `Succeeded`. IP pública Azure: `158.23.21.92`. La LAN confirmada es `192.168.50.0/24` y el FQDN es `azure.jaropro.net`. Posteriormente se creó manualmente `roger-vpn-office-01-connection`: en la última consulta de esta sesión tenía aprovisionamiento `Succeeded`, estado `NotConnected` y política IPsec **Default**, todavía sin túnel operativo verificado. Este modo no necesita Key Vault. Los parámetros locales están ignorados por Git.
 
 ## Índice
 
@@ -19,6 +19,7 @@ El despliegue es Bicep a nivel de Resource Group y usa modo incremental. El Reso
 - [What-if y despliegue](#7-what-if)
 - [DDNS, NAT y cambios de IP](#9-configuración-de-ddns)
 - [Configuración IPsec](#10-configuración-ipsec)
+- [Guía OPNsense 26.7: Connections y VTI](docs/opnsense-26.7-azure-vti.md)
 - [Pruebas y operación](#11-pruebas)
 - [Troubleshooting](#13-troubleshooting)
 - [Datos pendientes](#14-datos-pendientes)
@@ -372,6 +373,10 @@ El failover del ER605 no equivale a failover VPN instantáneo: actualización DN
 
 ## 10. Configuración IPsec
 
+Para la versión **OPNsense 26.7.6_3-amd64** aportada por el operador, seguir la [guía paso a paso de Connections y VTI](docs/opnsense-26.7-azure-vti.md). Incluye campos, autenticación PSK, rutas, reglas, NAT-T detrás del ER605, pruebas y rollback. El procedimiento todavía no se ha aplicado ni probado en el firewall.
+
+**Antes de probar:** reemplazar la PSK expuesta en una captura anterior e introducir el nuevo valor solo en Azure Portal y OPNsense. La conexión manual se observó con política **Default**; cambiarla a **Custom** conforme a la guía para alinear los algoritmos. No se modificaron la política ni la PSK al redactar esta documentación.
+
 Crear una PSK aleatoria, de alta entropía e independiente por oficina. En modo administrado, guardarla directamente como secreto de Key Vault con el nombre indicado por `pskSecretName`. En modo manual, introducirla directamente en Azure Portal y OPNsense, sin Key Vault. Nunca pasar el valor por línea de comandos, Bicep, parámetros, variables de entorno compartidas, logs o chat.
 
 ### Conexión manual después de desplegar la infraestructura
@@ -399,12 +404,13 @@ Configurar OPNsense con los valores que coincidan con `modules/vpn-connection.bi
 | Mode | Tunnel |
 | PSK | El secreto independiente de esa oficina |
 | Remote endpoint | IP pública de Azure VPN Gateway |
-| Local networks | Solo `192.168.50.0/24` en jaropro |
-| Remote networks | Hub y prefijos de todos los Spokes |
+| Prefijo LAN autorizado en Azure LNG | Solo `192.168.50.0/24` en jaropro |
+| Destinos de rutas privadas en OPNsense | Hub y prefijos de todos los Spokes |
+| Selectores CHILD en modo VTI | Local y Remote `0.0.0.0/0`, con Policies desactivado; no son rutas |
 
 Habilitar DPD, revisar NAT-T y confirmar que UDP 500 y UDP 4500 estén permitidos donde corresponda. Las pantallas/campos dependen de la versión de OPNsense. No usar reglas `Any → Any` permanentes; permitir únicamente los flujos requeridos. Excluir el tráfico privado Azure del Outbound NAT de OPNsense para conservar las IP LAN.
 
-Aplicar esa exclusión solo a destinos `10.100.0.0/24`, `10.101.0.0/24` y `10.102.0.0/24`; conservar el NAT y la ruta por defecto de Internet. Alinear rutas/selectores IPsec para esos destinos, sin anunciar las redes ISP/tránsito ni introducir `0.0.0.0/0` por el túnel. Elegir y comprobar un modo IPsec coherente con las políticas y rutas de la versión OPNsense instalada antes de producción.
+Aplicar esa exclusión solo a destinos `10.100.0.0/24`, `10.101.0.0/24` y `10.102.0.0/24`; conservar el NAT y la ruta por defecto de Internet. Si las reglas NAT existentes solo coinciden con WAN, normalmente no hace falta agregar una excepción para la VTI. Crear únicamente las tres rutas privadas, sin anunciar las redes ISP/tránsito ni instalar una **ruta por defecto** `0.0.0.0/0` hacia el túnel. En VTI, los **selectores CHILD** amplios `0.0.0.0/0` son distintos de las rutas: se usan con **Policies desactivado**, y las rutas y reglas de firewall limitan el tráfico. Seguir la guía para no mezclar configuración VTI y policy-based.
 
 La LAN anuncia actualmente gateway `192.168.50.254` por DHCP del ROG; esto **no garantiza** conmutación automática al ROG `192.168.50.1`. Los DNS primario/secundario tampoco garantizan uso secuencial. No se rediseña LAN/DHCP. Pi-hole `192.168.50.127` puede necesitar forwarding condicional hacia un resolvedor alcanzable en Azure si se requieren zonas privadas; vincular Private DNS a una VNet no basta para resolverlas desde la oficina. No se añade ningún servicio de resolución pagado.
 
@@ -446,7 +452,7 @@ pwsh -NoProfile -File .\tests\vpn.Tests.ps1
 - Mantener estables `resourcePrefix`, nombres de oficinas, nombres de Spokes y nombres de subred.
 - Agregar oficinas/Spokes declarativamente, ejecutar Validate y WhatIf y revisar cambios antes de Deploy.
 - Supervisar estado de la conexión, bytes de entrada/salida, resolución DDNS, cambio de IP, IKE/CHILD SA, DPD, rekey y logs de OPNsense.
-- Rotar PSK en ventana controlada: actualizar Key Vault y OPNsense coordinadamente; verificar el túnel y revocar el valor anterior. El cambio puede provocar interrupción.
+- Rotar PSK en ventana controlada: en modo manual, actualizar la conexión Azure y OPNsense coordinadamente. En modo administrado, actualizar el secreto de Key Vault, aplicar el cambio a la conexión mediante el despliegue validado y coordinar OPNsense; cambiar solo Key Vault no actualiza una conexión existente. Verificar el túnel y retirar el valor anterior. El cambio puede provocar interrupción.
 - Para retirar infraestructura, preparar un procedimiento específico, identificar recursos por Resource ID y confirmar ownership. Nunca borrar el Resource Group como rollback.
 - El SKU, región, transferencia, Firewall, Bastion y retención de logs influyen en costo. Consultar Azure Pricing Calculator antes de habilitar servicios opcionales.
 
