@@ -89,6 +89,9 @@
     "authorizedInboundRules": {
       "value": []
     },
+    "manageConnections": {
+      "value": true
+    },
     "keyVaultName": {
       "value": "CHANGE-ME"
     },

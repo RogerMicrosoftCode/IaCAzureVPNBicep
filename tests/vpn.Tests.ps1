@@ -50,6 +50,7 @@ function Reset-Fixture {
     $script:LocalOnly = $false
     $script:Mode = 'Validate'
     $script:whatIfResponse = '{"changes":[{"changeType":"Create","resourceId":"/test/resource"}]}'
+    $script:resourcesJson = '[]'
 }
 
 function New-Vnet {
@@ -72,7 +73,7 @@ function Invoke-Az {
         'bicep' { return }
         'account' { return $SubscriptionId }
         'group' { return 'true' }
-        'resource' { return '[]' }
+        'resource' { return $resourcesJson }
         'keyvault' { return '/test/keyvault' }
         'deployment' {
             if ('--no-pretty-print' -notin $Arguments) { return 'Note: human-readable what-if output' }
@@ -81,6 +82,12 @@ function Invoke-Az {
         'rest' {
             $url = $Arguments[[array]::IndexOf($Arguments, '--url') + 1]
             if ($responses.ContainsKey($url)) { return $responses[$url] }
+            if ($url -match '/providers/Microsoft.Network/virtualNetworkGateways/[^/?]+\?') {
+                $id = ($url -split '\?')[0].Replace('https://management.azure.com', '')
+                $gateway = @($collections.virtualNetworkGateways | Where-Object { $_.id -eq $id })
+                if ($gateway.Count -ne 1) { throw "Unexpected gateway detail URL: $url" }
+                return ($gateway[0] | ConvertTo-Json -Depth 30)
+            }
             if ($url -notmatch '/providers/Microsoft.Network/([^/?]+)\?') {
                 throw "Unexpected inventory URL: $url"
             }
@@ -158,6 +165,22 @@ try {
     Assert-Throws { Assert-AzureAddressAvailability $configuration $ResourceGroupName } 'Missing P2S address pool' 'incomplete P2S inventory stops preflight'
 
     Reset-Fixture
+    $gatewayId = "$baseId/virtualNetworkGateways/jaropro-vpn-gateway"
+    $collections.virtualNetworkGateways = @(@{
+        id = $gatewayId
+        properties = @{ vpnClientConfiguration = @{ vpnClientProtocols = @('OpenVPN', 'IkeV2') } }
+    })
+    $gatewayUrl = "https://management.azure.com${gatewayId}?api-version=2024-05-01"
+    $responses[$gatewayUrl] = (@{ id = $gatewayId; properties = @{ vpnClientConfiguration = $null } } | ConvertTo-Json -Depth 10)
+    Assert-AzureAddressAvailability $configuration $ResourceGroupName
+    Assert-True ($calls.Count -eq 6) 'gateway detail confirms absent P2S despite list API default fields'
+    $responses[$gatewayUrl] = '{}'
+    Assert-Throws { Assert-AzureAddressAvailability $configuration $ResourceGroupName } 'Incomplete gateway detail' 'malformed gateway detail cannot bypass P2S checks'
+    $responses.Remove($gatewayUrl)
+    $collections.virtualNetworkGateways = @()
+    Assert-Throws { Invoke-Az @('rest', '--method', 'get', '--url', $gatewayUrl) } 'Unexpected gateway detail' 'inaccessible gateway detail is not a success-shaped fallback'
+
+    Reset-Fixture
     $remoteId = '/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/remote/providers/Microsoft.Network/virtualNetworks/remote'
     $local = New-Vnet "$baseId/virtualNetworks/local" @('10.0.0.0/16')
     $local.properties.virtualNetworkPeerings = @(@{ properties = @{ remoteVirtualNetwork = @{ id = $remoteId } } })
@@ -225,6 +248,44 @@ try {
         $dispatchPattern = [regex]::Escape("'$modeName' {") + '\s+\$(?:validation|null) = Assert-Configuration'
         Assert-True ($scriptText -match $dispatchPattern) "$modeName dispatch starts with shared preflight"
     }
+
+    Reset-Fixture
+    $configuration.parameters.manageConnections.value = $false
+    $configuration.parameters.PSObject.Properties.Remove('keyVaultName')
+    $configuration.parameters.offices.value[0].PSObject.Properties.Remove('pskSecretName')
+    $configuration | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $parameterPath
+    $manualOutput = @(Assert-Configuration 3>&1)
+    Assert-True (@($calls | Where-Object { $_[0] -eq 'keyvault' }).Count -eq 0) 'manual mode requires no Key Vault and makes no vault queries'
+    Assert-True (@($calls | Where-Object { $_[0] -eq 'rest' }).Count -eq 5) 'manual mode still checks all network inventory'
+    Assert-True ("$($manualOutput | Where-Object { $_ -is [System.Management.Automation.WarningRecord] })" -like '*no tunnel is established*') 'manual mode explicitly warns that IPsec is deferred'
+    $configuration.parameters.offices.value[0].addressPrefixes = @('10.100.0.0/24')
+    $configuration | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $parameterPath
+    Assert-Throws { Assert-Configuration } 'overlaps Azure prefix' 'manual mode cannot bypass LAN overlap validation'
+    $configuration.parameters.offices.value[0] | Add-Member -NotePropertyName sharedKey -NotePropertyValue 'not-a-real-secret'
+    $configuration | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $parameterPath
+    Assert-Throws { Assert-Configuration } 'not PSKs' 'manual mode still rejects inline shared keys'
+
+    Reset-Fixture
+    $configuration.parameters.manageConnections.value = 'false'
+    $configuration | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $parameterPath
+    Assert-Throws { Assert-Configuration } 'JSON boolean' 'string false is not a valid manual-mode switch'
+    Reset-Fixture
+    $configuration.parameters.PSObject.Properties.Remove('manageConnections')
+    $configuration.parameters.PSObject.Properties.Remove('keyVaultName')
+    $configuration | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $parameterPath
+    Assert-Throws { Assert-Configuration } 'existing Key Vault' 'omitted mode preserves the managed Key Vault requirement'
+    Reset-Fixture
+    $configuration.parameters.offices.value[0].PSObject.Properties.Remove('pskSecretName')
+    $configuration | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $parameterPath
+    Assert-Throws { Assert-Configuration } 'must name its PSK secret' 'managed mode still requires office secret names'
+
+    Reset-Fixture
+    $resourcesJson = '[{"id":"/test/connection","name":"jaropro-office-01-connection","type":"Microsoft.Network/connections","tags":{}}]'
+    Assert-OwnedResourceNames -ResourceGroup $ResourceGroupName -Prefix 'jaropro' -ManageConnections $false
+    Assert-True ($calls.Count -eq 1) 'manual connections without ownership tags are preserved on redeploy'
+    Assert-Throws { Assert-OwnedResourceNames -ResourceGroup $ResourceGroupName -Prefix 'jaropro' } 'Resource collision' 'managed mode rejects taking over an unowned connection'
+    $resourcesJson = '[{"id":"/test/vnet","name":"jaropro-hub-vnet","type":"Microsoft.Network/virtualNetworks","tags":{}}]'
+    Assert-Throws { Assert-OwnedResourceNames -ResourceGroup $ResourceGroupName -Prefix 'jaropro' -ManageConnections $false } 'Resource collision' 'manual mode still protects unowned infrastructure'
 
     Reset-Fixture
     $whatIfResult = Invoke-WhatIf | ConvertFrom-Json

@@ -272,6 +272,16 @@ function Assert-AzureAddressAvailability {
         }
     }
     foreach ($gateway in $gateways) {
+        # List responses can include default P2S fields even when the resource GET has no P2S configuration.
+        if ($null -ne $gateway.properties.vpnClientConfiguration) {
+            $gatewayId = [string]$gateway.id
+            $json = Invoke-Az @('rest', '--method', 'get', '--url', "https://management.azure.com${gatewayId}?api-version=2024-05-01", '--output', 'json')
+            $detail = ($json -join "`n") | ConvertFrom-Json
+            if ($null -eq $detail -or $detail.id -ne $gatewayId -or $null -eq $detail.properties) {
+                throw "Incomplete gateway detail for '$gatewayId'; P2S availability was not verified."
+            }
+            $gateway = $detail
+        }
         if ($gateway.id -eq "$baseId/virtualNetworkGateways/$prefix-vpn-gateway" -and
             $null -ne $gateway.properties.vpnClientConfiguration) {
             throw "Existing P2S configuration on '$($gateway.id)' is not managed by this template; deployment stopped to preserve its addressing."
@@ -303,12 +313,16 @@ function Assert-OwnedResourceNames {
     param(
         [Parameter(Mandatory)][string]$ResourceGroup,
         [Parameter(Mandatory)][string]$Prefix,
-        [string[]]$PrivateDnsZoneNames = @()
+        [string[]]$PrivateDnsZoneNames = @(),
+        [bool]$ManageConnections = $true
     )
 
     $resourcesJson = Invoke-Az @('resource', 'list', '--resource-group', $ResourceGroup, '--output', 'json')
     $resources = ($resourcesJson -join "`n") | ConvertFrom-Json
     foreach ($resource in $resources) {
+        if (-not $ManageConnections -and $resource.type -eq 'Microsoft.Network/connections') {
+            continue
+        }
         $isSubnetChild = $resource.type -eq 'Microsoft.Network/virtualNetworks/subnets'
         $isPeering = $resource.type -eq 'Microsoft.Network/virtualNetworks/virtualNetworkPeerings'
         $isSolutionPrefix = -not $isSubnetChild -and -not $isPeering -and
@@ -359,6 +373,13 @@ function Assert-Configuration {
     $prefix = [string](Get-ParameterValue $configuration 'resourcePrefix')
     $location = [string](Get-ParameterValue $configuration 'location')
     $keyVaultName = [string](Get-ParameterValue $configuration 'keyVaultName')
+    $manageConnections = Get-ParameterValue $configuration 'manageConnections'
+    if ($null -eq $manageConnections) {
+        $manageConnections = $true
+    }
+    elseif ($manageConnections -isnot [bool]) {
+        throw 'manageConnections must be a JSON boolean.'
+    }
     $tags = Get-ParameterValue $configuration 'tags'
     $offices = @(Get-ParameterValue $configuration 'offices')
     $spokes = @(Get-ParameterValue $configuration 'spokes')
@@ -379,7 +400,7 @@ function Assert-Configuration {
     if ([string]::IsNullOrWhiteSpace($location) -or $location -match '(?i)CHANGE-ME|REPLACE') {
         throw 'Set the final Azure region in the parameter file.'
     }
-    if ([string]::IsNullOrWhiteSpace($keyVaultName) -or $keyVaultName -match '(?i)CHANGE-ME|REPLACE') {
+    if ($manageConnections -and ([string]::IsNullOrWhiteSpace($keyVaultName) -or $keyVaultName -match '(?i)CHANGE-ME|REPLACE')) {
         throw 'Set the name of an existing Key Vault in the parameter file.'
     }
     foreach ($tagName in @('Solution', 'Environment', 'Owner', 'CostCenter')) {
@@ -435,11 +456,13 @@ function Assert-Configuration {
         if (@($office.addressPrefixes).Count -eq 0) {
             throw "Office '$($office.name)' must define at least one on-premises address prefix."
         }
-        if ([string]::IsNullOrWhiteSpace([string]$office.pskSecretName)) {
-            throw "Office '$($office.name)' must name its PSK secret in Key Vault."
-        }
-        if (-not $pskSecretNames.Add([string]$office.pskSecretName)) {
-            throw "Each office must use a distinct Key Vault PSK secret name; duplicate '$($office.pskSecretName)'."
+        if ($manageConnections) {
+            if ([string]::IsNullOrWhiteSpace([string]$office.pskSecretName)) {
+                throw "Office '$($office.name)' must name its PSK secret in Key Vault."
+            }
+            if (-not $pskSecretNames.Add([string]$office.pskSecretName)) {
+                throw "Each office must use a distinct Key Vault PSK secret name; duplicate '$($office.pskSecretName)'."
+            }
         }
         foreach ($prefixValue in $office.addressPrefixes) {
             $officeRange = ConvertTo-IPv4Range ([string]$prefixValue)
@@ -558,6 +581,10 @@ function Assert-Configuration {
         }
     }
 
+    if (-not $manageConnections) {
+        Write-Warning 'Infrastructure-only mode: Key Vault and IPsec connections are not managed. Create the connections and configure matching PSKs manually after deployment; no tunnel is established by this template.'
+    }
+
     $buildOutput = Join-Path $env:TEMP ("hybrid-vpn-{0}.json" -f [guid]::NewGuid())
     try {
         Invoke-Az @('bicep', 'build', '--file', $templateFile, '--outfile', $buildOutput) | Out-Null
@@ -587,18 +614,20 @@ function Assert-Configuration {
     if ($groupExists.Trim() -ne 'true') {
         throw "Resource Group '$ResourceGroupName' does not exist. This solution will not create it."
     }
-    Assert-OwnedResourceNames -ResourceGroup $ResourceGroupName -Prefix $prefix -PrivateDnsZoneNames @((Get-ParameterValue $configuration 'privateDnsZones'))
+    Assert-OwnedResourceNames -ResourceGroup $ResourceGroupName -Prefix $prefix -PrivateDnsZoneNames @((Get-ParameterValue $configuration 'privateDnsZones')) -ManageConnections $manageConnections
 
-    $keyVaultRg = [string](Get-ParameterValue $configuration 'keyVaultResourceGroupName')
-    if ([string]::IsNullOrWhiteSpace($keyVaultRg)) {
-        $keyVaultRg = $ResourceGroupName
+    if ($manageConnections) {
+        $keyVaultRg = [string](Get-ParameterValue $configuration 'keyVaultResourceGroupName')
+        if ([string]::IsNullOrWhiteSpace($keyVaultRg)) {
+            $keyVaultRg = $ResourceGroupName
+        }
+        $keyVaultSubscription = [string](Get-ParameterValue $configuration 'keyVaultSubscriptionId')
+        $keyVaultArguments = @('keyvault', 'show', '--name', $keyVaultName, '--resource-group', $keyVaultRg, '--query', 'id', '--output', 'tsv')
+        if (-not [string]::IsNullOrWhiteSpace($keyVaultSubscription)) {
+            $keyVaultArguments += @('--subscription', $keyVaultSubscription)
+        }
+        $null = Invoke-Az $keyVaultArguments
     }
-    $keyVaultSubscription = [string](Get-ParameterValue $configuration 'keyVaultSubscriptionId')
-    $keyVaultArguments = @('keyvault', 'show', '--name', $keyVaultName, '--resource-group', $keyVaultRg, '--query', 'id', '--output', 'tsv')
-    if (-not [string]::IsNullOrWhiteSpace($keyVaultSubscription)) {
-        $keyVaultArguments += @('--subscription', $keyVaultSubscription)
-    }
-    $null = Invoke-Az $keyVaultArguments
 
     return [pscustomobject]@{
         Configuration = $configuration

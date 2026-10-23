@@ -2,11 +2,11 @@
 
 ## 1. Resumen
 
-Esta solución despliega una VNet Hub con Azure VPN Gateway, una o más conexiones Site-to-Site IPsec/IKEv2 a oficinas OPNsense con IPv4 pública dinámica, VNets Spoke, peerings y controles de entrada básicos. Las oficinas dinámicas se configuran en Azure con el FQDN DDNS; el script puede consultar DNS para diagnóstico, pero nunca guarda la IP resuelta en la configuración.
+Esta solución despliega una VNet Hub con Azure VPN Gateway, Local Network Gateways para oficinas OPNsense con IPv4 pública dinámica, VNets Spoke, peerings y controles de entrada básicos. Puede administrar conexiones Site-to-Site IPsec/IKEv2 usando Key Vault (`manageConnections=true`, predeterminado) o desplegar solo la infraestructura y dejar las conexiones y PSK para configuración manual en Azure Portal (`manageConnections=false`, sin Key Vault). Las oficinas dinámicas se configuran en Azure con el FQDN DDNS; el script puede consultar DNS para diagnóstico, pero nunca guarda la IP resuelta en la configuración.
 
 El despliegue es Bicep a nivel de Resource Group y usa modo incremental. El Resource Group debe existir; los scripts no lo crean ni lo eliminan. Los recursos de la solución llevan el tag `Solution=hybrid-vpn-bicep`. El script detiene la operación si detecta una colisión de nombres sin ese tag.
 
-> **Estado:** plantilla de referencia adaptada a jaropro. La LAN confirmada es `192.168.50.0/24` y el FQDN elegido es `azure.jaropro.net`. Persisten placeholders de nombres, etiquetas y Key Vault; no está lista para desplegar. No se ha modificado Azure, DNS ni la LAN.
+> **Estado:** infraestructura desplegada y verificada en `APPSEROGERVPN`, suscripción `55318ed6-5d8a-4bd2-889f-10e502960c28`, con `manageConnections=false`. Despliegue `hybrid-vpn-infra-20261022`: `Succeeded`. IP pública Azure: `158.23.21.92`. La LAN confirmada es `192.168.50.0/24` y el FQDN es `azure.jaropro.net`. La conexión IPsec y su PSK se configurarán manualmente después; este modo no necesita Key Vault y todavía no hay un túnel establecido. Los parámetros locales están ignorados por Git.
 
 ## Índice
 
@@ -27,7 +27,7 @@ El despliegue es Bicep a nivel de Resource Group y usa modo incremental. El Reso
 
 ### Vista de infraestructura
 
-El Hub concentra el VPN Gateway y sus conexiones. Cada oficina tiene su propio Local Network Gateway (LNG), conexión IPsec y secreto PSK en Key Vault. Los peerings conectan el Hub con cada Spoke; Firewall, Bastion y Private DNS solo se despliegan según los parámetros opcionales.
+El Hub concentra el VPN Gateway y sus conexiones. Cada oficina tiene su propio Local Network Gateway (LNG). Los diagramas muestran la arquitectura completa: las conexiones IPsec y Key Vault corresponden al modo administrado; en modo manual, Bicep omite ambas dependencias y las conexiones se crean posteriormente desde el portal. Los peerings conectan el Hub con cada Spoke; Firewall, Bastion y Private DNS solo se despliegan según los parámetros opcionales.
 
 ```mermaid
 flowchart LR
@@ -136,9 +136,9 @@ flowchart LR
 
 ## 2. Supuestos
 
-- El Resource Group objetivo y el Key Vault ya existen.
-- La cuenta de despliegue tiene permisos para administrar los recursos de red de la solución y leer los secretos de conexión desde Key Vault.
-- Cada oficina tiene FQDN DDNS público, prefijos LAN sin solapamientos y un PSK independiente guardado como secreto en Key Vault.
+- El Resource Group objetivo existe. Key Vault solo es necesario si `manageConnections=true`.
+- La cuenta de despliegue tiene permisos para administrar los recursos de red de la solución. El modo administrado requiere además acceso de despliegue a los secretos de Key Vault.
+- Cada oficina tiene FQDN DDNS público y prefijos LAN sin solapamientos. La PSK independiente se recupera desde Key Vault en modo administrado o se introduce manualmente en Azure Portal y OPNsense en modo manual.
 - Los datos de `main.parameters.example.json` son ejemplos no desplegables. No contienen PSK ni token DDNS.
 - La configuración de ejemplo usa `mexicocentral`; confirmar la disponibilidad regional del SKU elegido antes de desplegar.
 - BGP, Azure Firewall y Azure Bastion están deshabilitados por defecto. No se agregan rutas forzadas ni se habilita tránsito Spoke-to-Spoke.
@@ -160,9 +160,10 @@ flowchart LR
 
 - Cada Local Network Gateway (LNG) usa `fqdn` y `localNetworkAddressSpace`; no configura simultáneamente `gatewayIpAddress`.
 - Las IP DNS observadas son diagnósticas. No se resuelven para después guardar una IP fija en Bicep.
-- Cada conexión obtiene su PSK con `keyVault.getSecret(...)`, que se pasa a un parámetro seguro de módulo. No se escriben secretos en archivos, outputs ni mensajes de consola.
-- El PSK debe estar ya creado en Key Vault. La solución no crea, rota, muestra ni devuelve secretos.
-- Azure VPN Gateway necesita aplicar el PSK a la conexión y administra la configuración operativa de la conexión. El repositorio no puede evitar que el servicio Azure conserve internamente el valor necesario para terminar IPsec; Key Vault es la única fuente persistente controlada por el usuario.
+- Con `manageConnections=true`, cada conexión obtiene su PSK con `keyVault.getSecret(...)`, que se pasa a un parámetro seguro de módulo. El secreto debe existir; la solución no lo crea, rota, muestra ni devuelve.
+- Con `manageConnections=false`, no se requiere Key Vault ni `pskSecretName`. Bicep no crea ni actualiza conexiones IPsec; sí crea el VPN Gateway y los LNG. El validador conserva las comprobaciones de redes y ownership de infraestructura, pero no exige etiquetas de ownership para conexiones administradas manualmente.
+- Mantener `manageConnections=false` en futuros despliegues conserva las conexiones manuales en modo incremental. No cambiarlo a `true` sin planificar explícitamente su incorporación a Bicep y la gestión de PSK; no mezclar dos administradores de una misma conexión.
+- No se escriben PSK en archivos, outputs ni mensajes de consola. Azure VPN Gateway necesita conservar operativamente la PSK en la conexión; omitir Key Vault no elimina ese almacenamiento necesario.
 - Cambiar un LNG existente de endpoint IP a FQDN puede requerir recrear las conexiones asociadas. Planificarlo como cambio de mantenimiento.
 
 ### Opcionales
@@ -202,6 +203,15 @@ flowchart LR
 
 Copiar el ejemplo a `main.parameters.json` y reemplazar los datos pendientes. El archivo local está ignorado por Git. No añadir PSK, API token ni contraseñas a ese archivo.
 
+### Desplegar infraestructura sin Key Vault
+
+El ejemplo mantiene `manageConnections=true` para preservar el comportamiento anterior. Para configurar IPsec manualmente:
+
+- Establecer `"manageConnections": { "value": false }`.
+- Omitir `keyVaultName`, `keyVaultResourceGroupName`, `keyVaultSubscriptionId` y `offices[].pskSecretName`; no sustituirlos por una PSK.
+- Completar el resto de parámetros y ejecutar el mismo Validate, validación ARM, WhatIf y Deploy.
+- La salida incluye `localNetworkGatewayIds` y `connectionsManagedByTemplate`; el VPN Gateway genera cargos aunque aún no exista una conexión IPsec.
+
 ### Parámetros de red de ejemplo
 
 | Segmento | CIDR de ejemplo | Uso |
@@ -232,16 +242,17 @@ Consulta de solo lectura del 22/10/2026 en el destino:
 - Una VNet existente: `vnet-brujula-central-3936`, RG `ROGERPRIVATEGBB`, con `10.42.0.0/16` y sin peerings. No hay VPN gateways, LNG, hubs ni sitios Virtual WAN. El comprobador de inventario del script no detectó solapamientos con los prefijos de ejemplo.
 - Bicep compila. `Microsoft.Network` está registrado y anuncia VPN gateways, VNets e IP públicas en México Central. Las cuotas consultadas de VNets, NSG e IPv4 públicas Standard tienen margen; esto no garantiza capacidad para `VpnGw1AZ`.
 - El usuario confirmó que `azure.jaropro.net` es un registro público recién creado y correcto; queda pendiente su propagación o expiración de caché local. El equipo tiene configurados `192.168.50.127` y `192.168.50.1` como servidores DNS IPv4. La consulta explícita a `192.168.50.127` devolvió nombre inexistente; `192.168.50.1`, `1.1.1.1` y `8.8.8.8` devolvieron `189.236.75.52`. La respuesta local distinta no se considera evidencia de un DDNS incorrecto ni motivo para cambiar su configuración. Repetir CheckDns antes de las pruebas desde este equipo; la coincidencia con la WAN no se verificó directamente desde el router. No fijar esta IP en la plantilla. No se modificó DNS.
-- El Key Vault previo `kvbrujulacentral3936` en `ROGERPRIVATEGBB` no se seleccionó ni modificó. El usuario creó `keyvaultsecretsvpn` en `APPSEROGERVPN`, región `brazilsouth`, con RBAC, `enabledForTemplateDeployment=true` y acceso público deshabilitado. El vault puede referenciarse desde la VPN en `mexicocentral`; no se cambia su región ni su acceso de red. La identidad CLI no tiene permiso de lectura de metadatos de secretos (`ForbiddenByRbac`); no se leyeron valores de secretos ni se concedieron permisos.
-- `main.parameters.json` local, ignorado por Git, usa `roger-vpn`, `Environment=self-learning`, `Owner=rooliva`, `CostCenter=SE ROGEROA`, las redes confirmadas y `keyVaultName=keyvaultsecretsvpn`. Este nombre sustituye la propuesta anterior `kv-roger-vpn-10e50296`.
-- El preflight del script pasó. El what-if devolvió `Succeeded`: 13 creaciones de recursos de red, ningún borrado ni modificación y el Key Vault como `Ignore`. Se corrigió el formato de salida del script usando `--no-pretty-print` para procesar JSON.
-- **Despliegue bloqueado por el secreto:** la validación ARM con nivel `Provider` devolvió `KeyVaultParameterReferenceSecretRetrieveFailed` / `NotFound` para `vpn-office-01-psk`. El what-if satisfactorio no demuestra que el secreto exista. Crear el secreto con ese nombre en `keyvaultsecretsvpn`, usando la misma PSK que se configurará en OPNsense, o corregir el nombre en los parámetros si ya existe con otro nombre. No guardar el valor en el repositorio ni compartirlo en el chat. Repetir validación ARM, preflight y what-if antes de desplegar. No se desplegaron recursos.
+- El Key Vault previo `kvbrujulacentral3936` en `ROGERPRIVATEGBB` no se seleccionó ni modificó. El usuario creó `keyvaultsecretsvpn` en `APPSEROGERVPN`, región `brazilsouth`, con `enabledForTemplateDeployment=true` y acceso público deshabilitado. El vault puede referenciarse desde la VPN en `mexicocentral`; no se cambia su región ni su acceso de red. Tras el rechazo `ForbiddenByRbac` al crear el secreto, el usuario autorizó cambiar al modelo de políticas de acceso: se verificó `enableRbacAuthorization=false` y una política para su identidad con permisos de secretos `Get`, `List` y `Set`, sin permisos de claves o certificados. La prueba posterior de listado de metadatos ya no devuelve rechazo RBAC, sino `ForbiddenByConnection` porque el acceso público sigue deshabilitado. Para administrar secretos desde este equipo se necesita conectividad privada aprobada o un cambio de red autorizado por separado. No se leyeron valores de secretos.
+- El usuario creó `keyvaultsecretsSE` en `APPSEROGERVPN`, región `mexicocentral`, sustituyendo el anterior `keyvaultsecretsvpn`. Posteriormente decidió no usar Key Vault: `main.parameters.json` local, ignorado por Git, usa `roger-vpn`, `Environment=self-learning`, `Owner=rooliva`, `CostCenter=SE ROGEROA`, las redes confirmadas y `manageConnections=false`, sin parámetros de Key Vault ni nombres de secretos.
+- Se verificó en `keyvaultsecretsSE`: `publicNetworkAccess=Disabled`, `defaultAction=Deny`, regla `189.236.75.52/32`, `bypass=AzureServices`, `enabledForTemplateDeployment=true` y políticas de acceso con `Get`, `List` y `Set` de secretos para el usuario (además de otros permisos concedidos al crearlo). No hay Private Endpoint. La IP de salida actual coincide con la regla, pero el listado de metadatos falla con `ForbiddenByConnection`.
+- **Causa confirmada del bloqueo de red:** el Activity Log de la escritura del 22/10/2026 a las 22:12 UTC (correlación `d1b6226a-c21c-4a59-bdc1-9af6b36892f6`) registra `Microsoft.Authorization/policies/modify/action`. La asignación heredada `MCAPSGovDeployPolicies` (`MCAPSGov Deploy and Modify Policies`), en el management group `08cc2a62-5116-449e-bed1-98c29bd48de7`, aplica la definición `KeyVault_PublicNetwork_Modify`: `SFI-NS2.2.1 Secure PaaS Resources - Key Vaults (excluding NSP configured resources)`. Su regla reemplaza `Microsoft.KeyVault/vaults/publicNetworkAccess` por `Disabled`. Recrear el vault o repetir el cambio en Networking no resuelve esta restricción. Utilizar conectividad privada aprobada (Private Endpoint, DNS y una ruta desde el equipo) o solicitar una excepción formal al equipo de gobierno; no modificar ni eludir la política. No se crearon secretos ni se modificó el nuevo vault durante esta revisión.
+- Histórico del modo administrado: el preflight pasó y el what-if devolvió `Succeeded` con 13 creaciones, pero la validación ARM contra `keyvaultsecretsvpn` devolvió `KeyVaultParameterReferenceSecretRetrieveFailed` / `NotFound` para `vpn-office-01-psk`. Se corrigió el formato de salida del script usando `--no-pretty-print` para procesar JSON. Ese bloqueo ya no aplica al despliegue de infraestructura con `manageConnections=false`; no se leen ni necesitan secretos en ese modo.
 
 Las redes de módem Infinitum `192.168.4.0/24`, módem Totalplay `192.168.44.0/24` y tránsito ER605 `192.168.5.0/29` son exclusiones, no destinos LAN del túnel. El script rechaza anunciarlas (también prefijos agregados que las incluyan). La reserva Azure fuera de `192.168.0.0/16` evita utilizarlas en Hub/Spokes. No se cambia DHCP ni direccionamiento real.
 
 ## 6. Validación
 
-Requisitos locales: Azure CLI con Bicep disponible, PowerShell 7 recomendado, sesión Azure activa para validación remota, Resource Group existente y Key Vault existente.
+Requisitos locales: Azure CLI con Bicep disponible, PowerShell 7 recomendado, sesión Azure activa para validación remota y Resource Group existente. Key Vault existente solo para `manageConnections=true`.
 
 ```powershell
 Copy-Item .\main.parameters.example.json .\main.parameters.json
@@ -253,9 +264,11 @@ Completar los valores y validar:
 .\scripts\vpn.ps1 -Mode Validate -SubscriptionId '55318ed6-5d8a-4bd2-889f-10e502960c28' -ResourceGroupName 'APPSEROGERVPN' -ParameterFile .\main.parameters.json
 ```
 
-La validación compila Bicep, comprueba placeholders, CIDR IPv4, solapamientos internos, subredes dentro de VNets, FQDN, campos BGP cuando aplica, estado de Azure, existencia del RG/Key Vault y ownership. `SubscriptionId` es obligatorio para operaciones Azure: cada comando lo pasa explícitamente, sin cambiar tenant ni suscripción predeterminada. No cambia recursos ni lee el valor del PSK.
+La validación compila Bicep, comprueba placeholders, CIDR IPv4, solapamientos internos, subredes dentro de VNets, FQDN, campos BGP cuando aplica, estado de Azure, existencia del RG y ownership. Solo consulta Key Vault y exige nombres de secretos si `manageConnections=true`. `SubscriptionId` es obligatorio para operaciones Azure: cada comando lo pasa explícitamente, sin cambiar tenant ni suscripción predeterminada. No cambia recursos ni lee el valor del PSK.
 
 `Validate`, `WhatIf` y `Deploy` ejecutan el mismo preflight de solo lectura: compara intervalos IPv4 (incluidos solapamientos parciales y contención) contra todas las VNets, prefijos de LNG y pools P2S de gateways de esa suscripción. Recorre peerings y consulta las VNets remotas por ID, incluidas otras suscripciones; fallos de consulta, permisos o respuestas incompletas detienen la operación. Solo exime la coincidencia con el **ID exacto previsto y tag de ownership**, conservando los prefijos existentes. Bloquea cambios del espacio de VNets/LNG propios y renumeración o retirada de sus subredes; un tag o prefijo de nombre por sí solo nunca exime una red ajena. Si el gateway previsto ya tiene P2S, se detiene para no retirar una configuración que esta plantilla no administra.
+
+La API de listado puede devolver campos P2S predeterminados incluso cuando no hay P2S configurado. Cuando aparece ese objeto, el preflight consulta el gateway por ID para confirmar su configuración real antes de comprobar pools; una respuesta incompleta o inaccesible sigue deteniendo la validación.
 
 Si encuentra hubs o sitios Virtual WAN, se detiene para revisión específica de sus pools/rutas. No inventaría redes desconectadas de otras suscripciones, pools P2S de gateways de suscripciones remotas, rutas aprendidas BGP, UDR, traducciones NAT ni redes locales no declaradas. No demuestra disponibilidad de SKU/cuota regional ni reserva direcciones; repetir antes de desplegar y revisar el what-if. Un LNG ajeno que repita la LAN también provoca bloqueo conservador, aunque represente el mismo sitio: requiere revisión, no una excepción automática.
 
@@ -267,7 +280,7 @@ Para validar localmente sin consultar Azure:
 .\scripts\vpn.ps1 -Mode Validate -LocalOnly -ParameterFile .\main.parameters.json
 ```
 
-Para oficinas, `addressPrefixes` debe contener al menos un prefijo. El FQDN debe ser un nombre DNS válido. Cada oficina requiere `pskSecretName`. Al habilitar BGP, cada oficina necesita `asn` y `bgpPeerIp`.
+Para oficinas, `addressPrefixes` debe contener al menos un prefijo. El FQDN debe ser un nombre DNS válido. Cada oficina requiere `pskSecretName` solo en modo administrado. Al habilitar BGP, cada oficina necesita `asn` y `bgpPeerIp`.
 
 Al habilitar BGP, definir además `azureBgpAsn`. Azure asigna la dirección de peer del gateway; consultarla después del despliegue con `az network vnet-gateway list-bgp-peer-status --subscription 55318ed6-5d8a-4bd2-889f-10e502960c28 --resource-group APPSEROGERVPN --name PREFIJO-vpn-gateway`.
 
@@ -289,23 +302,35 @@ az deployment group validate --subscription 55318ed6-5d8a-4bd2-889f-10e502960c28
 
 ## 8. Despliegue
 
+### Ejecución de infraestructura autorizada el 22/10/2026
+
+- Destino: `APPSEROGERVPN`, suscripción `55318ed6-5d8a-4bd2-889f-10e502960c28`, región `mexicocentral`.
+- Parámetros: `manageConnections=false`, `VpnGw1AZ`/`Generation1`, sin BGP, Firewall, Bastion ni zonas DNS privadas.
+- Evidencia previa: 56 comprobaciones de regresión correctas; compilación Bicep correcta; preflight en vivo sin solapamientos; `az deployment group validate --validation-level Provider` con `provisioningState=Succeeded`; what-if con exactamente 12 creaciones de red, ningún borrado o modificación y el Key Vault existente como `Ignore`.
+- Despliegue incremental: `hybrid-vpn-infra-20261022`, finalizado en `Succeeded` el 22/10/2026 a las 22:50 UTC, sin error. Duración: 23 minutos y 55 segundos aproximadamente.
+- Verificación en vivo: VPN Gateway `roger-vpn-vpn-gateway` en `Succeeded`, route-based, `VpnGw1AZ`/`Generation1`, BGP deshabilitado; IP pública Standard estática `158.23.21.92`; tres VNets con los prefijos previstos; cuatro peerings `Connected`/`Succeeded`, dos con gateway transit y dos con useRemoteGateways; dos NSG en `Succeeded` sin reglas personalizadas; LNG `roger-vpn-office-01-lng` con `azure.jaropro.net` y `192.168.50.0/24`. La lista de conexiones VPN está vacía, como se solicitó.
+- Pruebas finales: 59 comprobaciones de regresión correctas y preflight en vivo satisfactorio después de desplegar, incluida la comprobación P2S por detalle del gateway. El what-if posterior no propone altas o bajas de recursos, pero muestra `Modify` por campos predeterminados/calculados de Azure (por ejemplo, metadatos de peering, tipo de configuración IP y valores implícitos). No se reaplicó ese plan; revisar sus deltas antes de futuros despliegues, sin asumir que es un no-op.
+- La conexión IPsec y la PSK quedan fuera de este despliegue y se configurarán manualmente al finalizar. No se modifica el Key Vault existente.
+
+### Comando para despliegues posteriores
+
 ```powershell
 .\scripts\vpn.ps1 -Mode Deploy -SubscriptionId '55318ed6-5d8a-4bd2-889f-10e502960c28' -ResourceGroupName 'APPSEROGERVPN' -ParameterFile .\main.parameters.json -DeploymentName 'hybrid-vpn'
 ```
 
 El script vuelve a validar, muestra el what-if, exige escribir `DEPLOY` y ejecuta `az deployment group create --mode Incremental`. No hay operación de crear o borrar Resource Group ni un modo Complete.
 
-Usar el mínimo privilegio. La identidad que ejecute el despliegue necesita permisos de escritura para los recursos declarados y permiso de lectura/deployment de secretos de Key Vault. Los nombres de secretos deben existir antes de crear las conexiones.
+Usar el mínimo privilegio. La identidad que ejecute el despliegue necesita permisos de escritura para los recursos declarados y, solo en modo administrado, permiso de lectura/deployment de secretos de Key Vault. En ese modo los secretos deben existir antes de crear las conexiones.
 
 ### Secuencia recomendada
 
 1. Completar los parámetros locales y confirmar que no contienen valores secretos.
 2. Ejecutar `Validate`; corregir todos los errores.
-3. Revisar permisos de despliegue, disponibilidad regional/SKU, cuotas y secretos existentes en Key Vault.
+3. Revisar permisos de despliegue, disponibilidad regional/SKU, cuotas y, si se administran conexiones, secretos existentes en Key Vault.
 4. Ejecutar `WhatIf` y revisar cada cambio.
 5. Acordar una ventana de cambio; crear/desplegar el Hub y el túnel puede causar interrupciones.
-6. Ejecutar `Deploy`, revisar el resultado y verificar gateway, peerings, conexiones y estado del túnel.
-7. Configurar OPNsense y confirmar tráfico con pruebas autorizadas.
+6. Ejecutar `Deploy`, revisar el resultado y verificar gateway y peerings. Con `manageConnections=false`, no esperar todavía una conexión ni un túnel.
+7. Crear la conexión manual si corresponde, configurar OPNsense y confirmar tráfico con pruebas autorizadas.
 
 ## 9. Configuración de DDNS
 
@@ -347,7 +372,20 @@ El failover del ER605 no equivale a failover VPN instantáneo: actualización DN
 
 ## 10. Configuración IPsec
 
-Crear una PSK aleatoria, de alta entropía e independiente por oficina. Guardarla directamente como secreto de Key Vault con el nombre indicado por `pskSecretName`; nunca pasar el valor por línea de comandos, Bicep, parámetros, variables de entorno compartidas, logs o chat. La plantilla consume el secreto de forma segura al desplegar la conexión.
+Crear una PSK aleatoria, de alta entropía e independiente por oficina. En modo administrado, guardarla directamente como secreto de Key Vault con el nombre indicado por `pskSecretName`. En modo manual, introducirla directamente en Azure Portal y OPNsense, sin Key Vault. Nunca pasar el valor por línea de comandos, Bicep, parámetros, variables de entorno compartidas, logs o chat.
+
+### Conexión manual después de desplegar la infraestructura
+
+Para `manageConnections=false`, esperar a que el VPN Gateway y los peerings terminen en `Succeeded`. Después, en Azure Portal:
+
+1. Abrir el VPN Gateway `roger-vpn-vpn-gateway` en `APPSEROGERVPN`, sección Connections, y agregar una conexión.
+2. Nombre: `roger-vpn-office-01-connection`. Tipo: Site-to-site (IPsec). Local Network Gateway: `roger-vpn-office-01-lng`.
+3. Seleccionar IKEv2, introducir la PSK manualmente y dejar BGP deshabilitado para la configuración local actual.
+4. Configurar una política IPsec/IKE personalizada que coincida en ambos extremos: IKE AES256/SHA256/DHGroup14, IPsec AES256/SHA256/PFS14, SA lifetime 27000 segundos y SA data size 102400000 KB, como en el módulo de referencia.
+5. Etiquetar la conexión con `Solution=hybrid-vpn-bicep` y las etiquetas del entorno, si se desea conservar la convención. Su administración seguirá siendo manual mientras `manageConnections=false`.
+6. Configurar OPNsense con la IP pública de Azure obtenida del output `vpnGatewayPublicIp`, la misma PSK y las políticas siguientes. Verificar NAT-T, rutas y reglas antes de probar tráfico.
+
+No crear conexiones desde el portal antes de terminar el gateway. Una conexión creada pero desconectada no demuestra que IPsec funcione. Mantener `manageConnections=false` en los siguientes despliegues para no sobrescribir la configuración manual.
 
 Configurar OPNsense con los valores que coincidan con `modules/vpn-connection.bicep`:
 
@@ -377,7 +415,7 @@ La política exacta del gateway y de OPNsense debe comprobarse con la versión/S
 Revisar el estado del túnel:
 
 ```powershell
-.\scripts\vpn.ps1 -Mode Status -SubscriptionId '662141d0-0308-4187-b46b-db1e9466b5ac' -ResourceGroupName 'NOMBRE-RG' -ParameterFile .\main.parameters.json
+.\scripts\vpn.ps1 -Mode Status -SubscriptionId '55318ed6-5d8a-4bd2-889f-10e502960c28' -ResourceGroupName 'APPSEROGERVPN' -ParameterFile .\main.parameters.json
 ```
 
 Probar destinos TCP definidos por el operador:
@@ -434,9 +472,9 @@ Antes de producción, completar y verificar esta lista por cada oficina y entorn
 - LAN jaropro confirmada: `192.168.50.0/24`; verificar que solo esta se anuncie.
 - Proveedor DDNS.
 - API token DDNS (guardar en OPNsense/proveedor; no mostrarlo ni incluirlo en archivos).
-- PSK independiente por oficina (solo Key Vault y OPNsense; no mostrarla).
-- Nombre de cada secreto en Key Vault.
-- Key Vault existente, suscripción y Resource Group.
+- PSK independiente por oficina, introducida en Azure Portal y OPNsense en modo manual; no mostrarla ni guardarla en parámetros.
+- Solo en modo administrado: nombre de cada secreto en Key Vault.
+- Solo en modo administrado: Key Vault existente, suscripción y Resource Group.
 - Región Azure definitiva.
 - `Environment`.
 - `Owner`.

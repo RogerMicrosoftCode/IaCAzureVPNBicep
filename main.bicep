@@ -39,7 +39,7 @@ param enableBgp bool = false
 @description('Azure VPN Gateway ASN when BGP is enabled.')
 param azureBgpAsn int = 65515
 
-@description('Office definitions. Each office uses an FQDN and its own Key Vault secret.')
+@description('Office definitions. Each office uses an FQDN; pskSecretName is required only when manageConnections is true.')
 @minLength(1)
 param offices array
 
@@ -50,8 +50,11 @@ param spokes array
 @description('Inbound TCP rules allowed from the configured office prefixes. Empty means no custom inbound allow rules.')
 param authorizedInboundRules array = []
 
-@description('Name of an existing Key Vault containing one distinct PSK secret per office.')
-param keyVaultName string
+@description('Manage IPsec connections and retrieve PSKs from Key Vault. Set false to create the connections manually after infrastructure deployment.')
+param manageConnections bool = true
+
+@description('Existing Key Vault containing one PSK secret per office. Required only when manageConnections is true.')
+param keyVaultName string = ''
 
 @description('Resource group containing the existing Key Vault.')
 param keyVaultResourceGroupName string = resourceGroup().name
@@ -87,7 +90,7 @@ var privateDnsSpokeLinkData = [for linkIndex in range(0, length(privateDnsZones)
   spokeIndex: linkIndex % length(spokes)
 }]
 
-resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
+resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' existing = if (manageConnections) {
   name: keyVaultName
   scope: resourceGroup(keyVaultSubscriptionId, keyVaultResourceGroupName)
 }
@@ -301,14 +304,14 @@ resource officeLocalNetworkGateways 'Microsoft.Network/localNetworkGateways@2024
   )
 }]
 
-module officeConnections 'modules/vpn-connection.bicep' = [for (office, officeIndex) in offices: {
+module officeConnections 'modules/vpn-connection.bicep' = [for (office, officeIndex) in offices: if (manageConnections) {
   name: '${resourcePrefix}-connection-${uniqueString(office.name, resourceGroup().id)}'
   params: {
     location: location
     connectionName: '${resourcePrefix}-${office.name}-connection'
     virtualNetworkGatewayId: vpnGateway.id
     localNetworkGatewayId: officeLocalNetworkGateways[officeIndex].id
-    sharedKey: keyVault.getSecret(office.pskSecretName)
+    sharedKey: keyVault!.getSecret(office.pskSecretName)
     enableBgp: enableBgp
     tags: tags
   }
@@ -447,3 +450,5 @@ output hubVnetId string = hubVnet.id
 output vpnGatewayName string = vpnGateway.name
 output vpnGatewayPublicIp string = gatewayPublicIp.properties.ipAddress
 output spokeVnetIds array = [for (spoke, spokeIndex) in spokes: spokeVnets[spokeIndex].id]
+output localNetworkGatewayIds array = [for (office, officeIndex) in offices: officeLocalNetworkGateways[officeIndex].id]
+output connectionsManagedByTemplate bool = manageConnections
